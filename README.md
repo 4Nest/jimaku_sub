@@ -14,6 +14,22 @@
 - 🗄️ **状态持久化** — SQLite 存储已通知记录，重启不重复推送；通知发送失败自动下轮重试
 - 🛡️ **稳定运行** — 优雅停机、崩溃自动重启、Docker 健康检查、Telegram 限流退避、日志按天轮转+定期清理
 - 🐳 **Docker 部署** — 一键容器化运行
+- 📡 **全量频道推送** — 可选把 jimaku 全站新字幕以文件形式直发频道，Caption 含日/英/罗马音作品名
+
+## 全量频道推送
+
+设置 `CHANNEL_ENABLED=true` + `CHANNEL_CHAT_ID` 后，除订阅通知外，jimaku 全站新字幕会**直接以文件发到指定频道**（不走订阅匹配）：
+
+- 文件消息 Caption：🇯🇵 日语名 / 🇬🇧 英语名 / 🔤 罗马音名（来自 AniList，自动缓存）+ 文件名、大小、jimaku 链接
+- 超过 48MB 的文件改发带下载链接的文字卡片
+- 只发功能开启后新出现的字幕，不回填历史；失败自动重试，重试耗尽发私聊告警
+
+配置步骤：
+
+1. 创建频道，把 bot 加为**管理员**（发布消息权限）
+2. 获取频道数字 id：Telegram Web 打开频道，地址栏 `/#-100xxxxxxxxxx`；或转发频道消息给 @userinfobot
+3. `.env` 加 `CHANNEL_ENABLED=true` 和 `CHANNEL_CHAT_ID=-100xxxxxxxxxx`，重启容器
+4. 启动时频道会收到确认消息；收不到说明 bot 权限不足（服务会启动失败并提示）
 
 ## Telegram Bot 命令
 
@@ -67,6 +83,8 @@ docker compose up -d
 | `SCHEDULER_INTERVAL_SECONDS` | ❌ | 检查间隔秒数 (默认 `300`) |
 | `DATABASE_URL` | ❌ | SQLite 路径 (默认 `sqlite://data/jimaku_subscriber.db`，compose 中指向 `/app/data`) |
 | `LOG_RETENTION_DAYS` | ❌ | 日志保留天数 (默认 `30`) |
+| `CHANNEL_ENABLED` | ❌ | 全量字幕频道推送 (`true`/`false`，默认 `false`) |
+| `CHANNEL_CHAT_ID` | ❌ | 频道数字 id（`-100` 开头，启用频道推送时必需） |
 | `RUST_LOG` | ❌ | 日志级别 (默认 `info,teloxide=warn`) |
 | `SUBSCRIPTION_ANILIST_IDS` | ❌ | 订阅的 AniList ID，逗号分隔 |
 | `SUBSCRIPTION_NAME_KEYWORDS` | ❌ | 订阅关键词，逗号分隔 |

@@ -74,4 +74,58 @@ impl TelegramNotifier {
     pub fn chat_id(&self) -> ChatId {
         self.chat_id
     }
+
+    /// 共享限流 Bot 实例（ChannelNotifier 复用同一限流队列，避免叠加触发 429）
+    pub fn bot(&self) -> ThrottledBot {
+        self.bot.clone()
+    }
+}
+
+/// 全量字幕频道推送：与私聊通知共享限流 Bot，目标为频道
+#[derive(Clone)]
+pub struct ChannelNotifier {
+    bot: ThrottledBot,
+    chat_id: ChatId,
+}
+
+impl ChannelNotifier {
+    pub fn new(bot: ThrottledBot, chat_id: impl AsRef<str>) -> Result<Self> {
+        let raw = chat_id.as_ref().trim();
+        let id: i64 = raw
+            .parse()
+            .context("CHANNEL_CHAT_ID 必须是数字频道 id（-100 开头，不支持 @username）")?;
+        anyhow::ensure!(
+            id < 0,
+            "CHANNEL_CHAT_ID 必须是频道/群组 id（负数，-100 开头），当前值: {}",
+            raw
+        );
+        Ok(Self {
+            bot,
+            chat_id: ChatId(id),
+        })
+    }
+
+    /// 发送字幕文件到频道，Caption 为 HTML（≤1024 字符）
+    pub async fn send_subtitle_document(
+        &self,
+        path: &std::path::Path,
+        caption: &str,
+    ) -> Result<()> {
+        self.bot
+            .send_document(self.chat_id, teloxide::types::InputFile::file(path))
+            .caption(caption)
+            .parse_mode(ParseMode::Html)
+            .await?;
+        info!("Channel document sent: {:?}", path);
+        Ok(())
+    }
+
+    /// 发送文字卡片到频道（超大文件的链接卡片、启动确认等）
+    pub async fn send_text_card(&self, text: &str) -> Result<()> {
+        self.bot
+            .send_message(self.chat_id, text)
+            .parse_mode(ParseMode::Html)
+            .await?;
+        Ok(())
+    }
 }

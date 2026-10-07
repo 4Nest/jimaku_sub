@@ -26,3 +26,9 @@ url = "sqlite://data/jimaku_subscriber.db"
 [logging]
 dir = "./logs"
 retention_days = 30
+
+# 全量字幕频道推送：jimaku 全站新字幕直接以文件发到频道
+# 需要把 bot 加为频道管理员（发布消息权限），chat_id 为数字频道 id（-100 开头）
+[channel]
+enabled = false
+chat_id = ""

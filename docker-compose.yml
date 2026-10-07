@@ -18,6 +18,9 @@ services:
       # 可选配置
       - DOWNLOAD_ENABLED=${DOWNLOAD_ENABLED:-false}
       - DOWNLOAD_PATH=${DOWNLOAD_PATH:-/app/downloads}
+      # 全量字幕频道推送（bot 需加为频道管理员）
+      - CHANNEL_ENABLED=${CHANNEL_ENABLED:-false}
+      - CHANNEL_CHAT_ID=${CHANNEL_CHAT_ID:-}
       #- SCHEDULER_INTERVAL_SECONDS=300
       #- SUBSCRIPTION_ANILIST_IDS=16498,1535
       #- SUBSCRIPTION_NAME_KEYWORDS=Attack on Titan,Shingeki

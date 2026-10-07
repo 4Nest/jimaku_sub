@@ -1,3 +1,4 @@
+mod anilist;
 mod bot;
 mod config;
 mod database;
@@ -21,7 +22,7 @@ use crate::config::{Config, LoggingConfig};
 use crate::database::Database;
 use crate::jimaku::JimakuClient;
 use crate::scheduler::Scheduler;
-use crate::telegram::TelegramNotifier;
+use crate::telegram::{ChannelNotifier, TelegramNotifier};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -47,11 +48,26 @@ async fn main() -> Result<()> {
     let notifier = TelegramNotifier::new(&config.telegram.bot_token, &config.telegram.chat_id)
         .context("Failed to create Telegram notifier")?;
 
+    // 频道全量推送：enabled 时装配并向频道发确认消息验证权限（bot 未加管理员则启动失败）
+    let channel = if config.channel.enabled {
+        let channel = ChannelNotifier::new(notifier.bot(), &config.channel.chat_id)
+            .context("Failed to create channel notifier")?;
+        channel
+            .send_text_card("📡 <b>全量字幕推送已开启</b>\n本频道将接收 jimaku 全站新字幕文件")
+            .await
+            .context("Failed to send channel startup message (bot 是否已加为频道管理员?)")?;
+        info!("Channel full-feed push enabled: {}", config.channel.chat_id);
+        Some(channel)
+    } else {
+        None
+    };
+
     let scheduler = Arc::new(Scheduler::new(
         config.clone(),
         scheduler_jimaku,
         db.clone(),
         notifier.clone(),
+        channel,
     ));
 
     let state = AppState {

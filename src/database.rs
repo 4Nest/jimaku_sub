@@ -137,6 +137,42 @@ impl Database {
         .await
         .context("Failed to create pending_searches table")?;
 
+        // 频道全量推送：pushed 1=已推送(含静默基线), 0=待推送(占位), -1=死信
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS channel_files (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                entry_id INTEGER NOT NULL,
+                entry_name TEXT NOT NULL,
+                file_name TEXT NOT NULL,
+                file_url TEXT NOT NULL UNIQUE,
+                file_size INTEGER,
+                pushed INTEGER NOT NULL DEFAULT 0,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                pushed_at TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_channel_files_entry ON channel_files(entry_id);
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .context("Failed to create channel_files table")?;
+
+        // AniList 罗马音标题缓存；romaji 为 NULL 表示负缓存（查无此条目）
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS anilist_titles (
+                anilist_id INTEGER PRIMARY KEY,
+                romaji TEXT,
+                fetched_at TEXT NOT NULL
+            );
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .context("Failed to create anilist_titles table")?;
+
         info!("Database migration completed");
         Ok(())
     }
@@ -511,6 +547,185 @@ impl Database {
                 .await?;
         Ok(row.0)
     }
+
+    // ---------- 频道全量推送 ----------
+
+    /// 读取频道推送基线时间（首次启用时由 scheduler 写入）
+    pub async fn get_channel_enabled_at(&self) -> Result<Option<DateTime<Utc>>> {
+        let row: Option<(String,)> =
+            sqlx::query_as("SELECT value FROM state WHERE key = 'channel_enabled_at'")
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(row.and_then(|(v,)| {
+            DateTime::parse_from_rfc3339(&v)
+                .ok()
+                .map(|dt| dt.with_timezone(&Utc))
+        }))
+    }
+
+    /// 写入频道推送基线时间；已存在则保持不变（只写一次）
+    pub async fn ensure_channel_enabled_at(&self, now: DateTime<Utc>) -> Result<DateTime<Utc>> {
+        sqlx::query(
+            "INSERT INTO state (key, value) VALUES ('channel_enabled_at', ?)
+             ON CONFLICT(key) DO NOTHING",
+        )
+        .bind(now.to_rfc3339())
+        .execute(&self.pool)
+        .await?;
+        Ok(self.get_channel_enabled_at().await?.unwrap_or(now))
+    }
+
+    pub async fn is_channel_pushed(&self, file_url: &str) -> Result<bool> {
+        let count: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM channel_files WHERE file_url = ? AND pushed != 0")
+                .bind(file_url)
+                .fetch_one(&self.pool)
+                .await?;
+        Ok(count.0 > 0)
+    }
+
+    /// 静默标记文件已推送（基线前的 backlog，不发频道）
+    pub async fn mark_channel_silent(
+        &self,
+        entry_id: i64,
+        entry_name: &str,
+        file_name: &str,
+        file_url: &str,
+        file_size: Option<i64>,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO channel_files
+             (entry_id, entry_name, file_name, file_url, file_size, pushed, attempts, created_at, pushed_at)
+             VALUES (?, ?, ?, ?, ?, 1, 0, ?, ?)
+             ON CONFLICT(file_url) DO NOTHING",
+        )
+        .bind(entry_id)
+        .bind(entry_name)
+        .bind(file_name)
+        .bind(file_url)
+        .bind(file_size)
+        .bind(Utc::now().to_rfc3339())
+        .bind(Utc::now().to_rfc3339())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// 插入/更新频道推送占位行（pushed=0），返回行 id。死信(-1)行保持死信。
+    pub async fn upsert_channel_pending(
+        &self,
+        entry_id: i64,
+        entry_name: &str,
+        file_name: &str,
+        file_url: &str,
+        file_size: Option<i64>,
+    ) -> Result<i64> {
+        let row: (i64,) = sqlx::query_as(
+            "INSERT INTO channel_files
+             (entry_id, entry_name, file_name, file_url, file_size, pushed, attempts, created_at)
+             VALUES (?, ?, ?, ?, ?, 0, 0, ?)
+             ON CONFLICT(file_url) DO UPDATE SET
+                entry_id = excluded.entry_id,
+                entry_name = excluded.entry_name,
+                file_name = excluded.file_name,
+                file_size = COALESCE(excluded.file_size, channel_files.file_size),
+                pushed = CASE WHEN channel_files.pushed = -1 THEN -1 ELSE 0 END
+             RETURNING id",
+        )
+        .bind(entry_id)
+        .bind(entry_name)
+        .bind(file_name)
+        .bind(file_url)
+        .bind(file_size)
+        .bind(Utc::now().to_rfc3339())
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(row.0)
+    }
+
+    pub async fn mark_channel_pushed(&self, id: i64) -> Result<()> {
+        sqlx::query("UPDATE channel_files SET pushed = 1, pushed_at = ? WHERE id = ?")
+            .bind(Utc::now().to_rfc3339())
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// 记录一次频道推送失败，返回当前失败次数；达到上限转死信(pushed=-1)。
+    pub async fn mark_channel_failed(&self, id: i64, max_attempts: i64) -> Result<i64> {
+        let row: (i64,) = sqlx::query_as(
+            "UPDATE channel_files
+             SET attempts = attempts + 1,
+                 pushed = CASE WHEN attempts + 1 >= ? THEN -1 ELSE pushed END
+             WHERE id = ?
+             RETURNING attempts",
+        )
+        .bind(max_attempts)
+        .bind(id)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(row.0)
+    }
+
+    /// 列出待推送（pushed=0）的频道文件，用于每轮独立重试
+    pub async fn list_channel_pending(&self) -> Result<Vec<ChannelFile>> {
+        let rows: Vec<(i64, i64, String, String, String, Option<i64>)> = sqlx::query_as(
+            "SELECT id, entry_id, entry_name, file_name, file_url, file_size
+             FROM channel_files WHERE pushed = 0 ORDER BY id",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(
+                |(id, entry_id, entry_name, file_name, file_url, file_size)| ChannelFile {
+                    id,
+                    entry_id,
+                    entry_name,
+                    file_name,
+                    file_url,
+                    file_size,
+                },
+            )
+            .collect())
+    }
+
+    // ---------- AniList 标题缓存 ----------
+
+    /// 读取缓存的罗马音标题。Ok(None)=未缓存；Ok(Some(None))=负缓存（查无条目）
+    pub async fn get_cached_romaji(&self, anilist_id: i32) -> Result<Option<Option<String>>> {
+        let row: Option<(Option<String>,)> =
+            sqlx::query_as("SELECT romaji FROM anilist_titles WHERE anilist_id = ?")
+                .bind(anilist_id)
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(row.map(|(romaji,)| romaji))
+    }
+
+    pub async fn cache_romaji(&self, anilist_id: i32, romaji: Option<&str>) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO anilist_titles (anilist_id, romaji, fetched_at) VALUES (?, ?, ?)
+             ON CONFLICT(anilist_id) DO UPDATE SET romaji = excluded.romaji, fetched_at = excluded.fetched_at",
+        )
+        .bind(anilist_id)
+        .bind(romaji)
+        .bind(Utc::now().to_rfc3339())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+}
+
+/// 待推送的频道文件记录
+#[derive(Debug, Clone)]
+pub struct ChannelFile {
+    pub id: i64,
+    pub entry_id: i64,
+    pub entry_name: String,
+    pub file_name: String,
+    pub file_url: String,
+    pub file_size: Option<i64>,
 }
 
 fn parse_keywords(value: Option<&str>) -> Vec<String> {
@@ -588,6 +803,70 @@ mod tests {
         assert_eq!(pending.entry_ids, vec![1, 2]);
         db.delete_pending_search("tok12345").await.unwrap();
         assert!(db.get_pending_search("tok12345").await.unwrap().is_none());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn channel_push_state_machine() {
+        let (url, dir) = temp_db_url("channel");
+        let db = Database::new(&url).await.unwrap();
+
+        // 基线时间只写一次
+        let t1 = db
+            .ensure_channel_enabled_at(chrono::Utc::now())
+            .await
+            .unwrap();
+        let t2 = db
+            .ensure_channel_enabled_at(chrono::Utc::now() + chrono::Duration::hours(1))
+            .await
+            .unwrap();
+        assert_eq!(t1, t2);
+
+        // 静默标记 backlog
+        db.mark_channel_silent(1, "e", "old.srt", "http://x/old", Some(1))
+            .await
+            .unwrap();
+        assert!(db.is_channel_pushed("http://x/old").await.unwrap());
+
+        // 占位 → 确认 roundtrip
+        let id = db
+            .upsert_channel_pending(1, "e", "new.srt", "http://x/new", None)
+            .await
+            .unwrap();
+        assert!(!db.is_channel_pushed("http://x/new").await.unwrap());
+        let pending = db.list_channel_pending().await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].file_url, "http://x/new");
+        db.mark_channel_pushed(id).await.unwrap();
+        assert!(db.is_channel_pushed("http://x/new").await.unwrap());
+        assert!(db.list_channel_pending().await.unwrap().is_empty());
+
+        // 5 次失败转死信，死信行 upsert 不复活
+        let id2 = db
+            .upsert_channel_pending(1, "e", "dead.srt", "http://x/dead", None)
+            .await
+            .unwrap();
+        for _ in 0..5 {
+            db.mark_channel_failed(id2, 5).await.unwrap();
+        }
+        db.upsert_channel_pending(1, "e", "dead.srt", "http://x/dead", None)
+            .await
+            .unwrap();
+        assert!(db.is_channel_pushed("http://x/dead").await.unwrap());
+        assert!(db.list_channel_pending().await.unwrap().is_empty());
+
+        // anilist 正/负缓存
+        assert!(db.get_cached_romaji(1).await.unwrap().is_none());
+        db.cache_romaji(1, Some("Honzuki no Gekokujou"))
+            .await
+            .unwrap();
+        assert_eq!(
+            db.get_cached_romaji(1).await.unwrap(),
+            Some(Some("Honzuki no Gekokujou".to_string()))
+        );
+        db.cache_romaji(2, None).await.unwrap();
+        assert_eq!(db.get_cached_romaji(2).await.unwrap(), Some(None));
 
         std::fs::remove_dir_all(&dir).ok();
     }

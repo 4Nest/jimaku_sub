@@ -1,11 +1,14 @@
 use crate::{
+    anilist::AnilistClient,
+    bot::text::{channel_caption, channel_link_card, ChannelSubtitle},
     config::Config,
     database::Database,
     downloader::Downloader,
-    jimaku::{Entry, JimakuClient},
-    telegram::{NewSubtitle, TelegramNotifier},
+    jimaku::{Entry, FileEntry, JimakuClient},
+    telegram::{ChannelNotifier, NewSubtitle, TelegramNotifier},
 };
 use anyhow::Result;
+use chrono::{DateTime, Utc};
 use std::sync::Arc;
 use tokio::time::{interval, Duration};
 use tokio_util::sync::CancellationToken;
@@ -16,6 +19,8 @@ pub struct Scheduler {
     jimaku: JimakuClient,
     db: Arc<Database>,
     notifier: TelegramNotifier,
+    channel: Option<ChannelNotifier>,
+    anilist: AnilistClient,
     downloader: Downloader,
 }
 
@@ -35,6 +40,7 @@ impl Scheduler {
         jimaku: JimakuClient,
         db: Arc<Database>,
         notifier: TelegramNotifier,
+        channel: Option<ChannelNotifier>,
     ) -> Self {
         let downloader = Downloader::new(&config.download.download_path);
 
@@ -43,6 +49,8 @@ impl Scheduler {
             jimaku,
             db,
             notifier,
+            channel,
+            anilist: AnilistClient::new(),
             downloader,
         }
     }
@@ -84,6 +92,24 @@ impl Scheduler {
         let entries = self.search_entries_with_retry(after).await?;
         info!("Found {} entries since last check", entries.len());
 
+        // 频道推送：写入/读取基线时间，并先独立重试上轮遗留的占位行
+        let channel_baseline = if self.channel.is_some() {
+            match self.db.ensure_channel_enabled_at(Utc::now()).await {
+                Ok(baseline) => {
+                    if let Err(e) = self.retry_channel_pending().await {
+                        error!("Failed to retry pending channel files: {}", e);
+                    }
+                    Some(baseline)
+                }
+                Err(e) => {
+                    error!("Failed to init channel baseline: {}", e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         // 合并配置文件订阅和数据库动态订阅
         let dynamic_subs = self.db.list_subscriptions().await?;
         let config_anilist_ids = &self.config.subscription.anilist_ids;
@@ -102,7 +128,30 @@ impl Scheduler {
                 .filter(|sub| entry.id == sub.entry_id)
                 .collect::<Vec<_>>();
 
-            if !is_global && !config_match && matching_dynamic_subs.is_empty() {
+            let sub_matched = is_global || config_match || !matching_dynamic_subs.is_empty();
+            if !sub_matched && self.channel.is_none() {
+                debug!("Entry {} does not match subscription, skipping", entry.id);
+                continue;
+            }
+
+            // files 每轮每 entry 只拉取一次，频道推送与订阅推送共用
+            let files = match self.jimaku.get_entry_files(entry.id).await {
+                Ok(files) => files,
+                Err(e) => {
+                    error!("Failed to get files for entry {}: {}", entry.id, e);
+                    continue;
+                }
+            };
+            if files.is_empty() {
+                continue;
+            }
+
+            // 频道全量推送（先于订阅路径，不走订阅匹配）
+            if let (Some(_), Some(baseline)) = (&self.channel, channel_baseline) {
+                self.process_channel_entry(&entry, &files, baseline).await;
+            }
+
+            if !sub_matched {
                 debug!("Entry {} does not match subscription, skipping", entry.id);
                 continue;
             }
@@ -148,7 +197,7 @@ impl Scheduler {
                 }
             };
 
-            if let Err(e) = self.process_entry(&entry, &policy).await {
+            if let Err(e) = self.process_entry(&entry, files, &policy).await {
                 error!("Failed to process entry {}: {}", entry.id, e);
             }
         }
@@ -187,12 +236,12 @@ impl Scheduler {
         }
     }
 
-    async fn process_entry(&self, entry: &Entry, policy: &EntryPolicy) -> Result<()> {
-        let files = self.jimaku.get_entry_files(entry.id).await?;
-        if files.is_empty() {
-            return Ok(());
-        }
-
+    async fn process_entry(
+        &self,
+        entry: &Entry,
+        files: Vec<FileEntry>,
+        policy: &EntryPolicy,
+    ) -> Result<()> {
         for file in files {
             if let Some(keywords) = policy.keyword_filter.as_deref() {
                 if !file_matches_keywords(&file.name, keywords) {
@@ -299,6 +348,246 @@ impl Scheduler {
         Ok(())
     }
 
+    // ---------- 频道全量推送 ----------
+
+    /// 频道推送一个 entry 的新文件：基线前的旧文件静默标记，新文件发文件+Caption
+    async fn process_channel_entry(
+        &self,
+        entry: &Entry,
+        files: &[FileEntry],
+        baseline: DateTime<Utc>,
+    ) {
+        // 分流：已知/死信跳过，基线前的静默标记，其余为待推送新文件
+        let mut new_files = Vec::new();
+        for file in files {
+            match channel_file_action(
+                self.db.is_channel_pushed(&file.url).await.unwrap_or(true),
+                file.last_modified,
+                baseline,
+            ) {
+                ChannelAction::Skip => continue,
+                ChannelAction::Silent => {
+                    if let Err(e) = self
+                        .db
+                        .mark_channel_silent(
+                            entry.id,
+                            &entry.name,
+                            &file.name,
+                            &file.url,
+                            Some(file.size),
+                        )
+                        .await
+                    {
+                        warn!("Failed to mark channel file silent {}: {}", file.name, e);
+                    }
+                }
+                ChannelAction::Send => new_files.push(file),
+            }
+        }
+        if new_files.is_empty() {
+            return;
+        }
+
+        // 确认有新文件要发才解析罗马音（惰性，不浪费 AniList 配额）
+        let romaji = self.resolve_romaji(entry).await;
+        let channel = self.channel.as_ref().expect("channel notifier missing");
+
+        for file in new_files {
+            let row_id = match self
+                .db
+                .upsert_channel_pending(
+                    entry.id,
+                    &entry.name,
+                    &file.name,
+                    &file.url,
+                    Some(file.size),
+                )
+                .await
+            {
+                Ok(id) => id,
+                Err(e) => {
+                    warn!("Failed to upsert channel pending {}: {}", file.name, e);
+                    continue;
+                }
+            };
+
+            let sub = ChannelSubtitle {
+                japanese_name: entry.japanese_name.as_deref(),
+                english_name: entry.english_name.as_deref(),
+                romaji: &romaji,
+                file_name: &file.name,
+                file_size: file.size,
+                file_url: &file.url,
+                entry_id: entry.id,
+            };
+
+            let result = if file.size > MAX_DOCUMENT_SIZE {
+                channel.send_text_card(&channel_link_card(&sub)).await
+            } else {
+                match self
+                    .downloader
+                    .download_subtitle(&entry.name, &file.name, &file.url)
+                    .await
+                {
+                    Ok(path) => {
+                        channel
+                            .send_subtitle_document(&path, &channel_caption(&sub))
+                            .await
+                    }
+                    Err(e) => Err(e),
+                }
+            };
+
+            match result {
+                Ok(_) => {
+                    if let Err(e) = self.db.mark_channel_pushed(row_id).await {
+                        warn!("Failed to mark channel pushed {}: {}", file.name, e);
+                    }
+                    info!("Channel pushed: {}", file.name);
+                }
+                Err(e) => {
+                    match self
+                        .db
+                        .mark_channel_failed(row_id, MAX_CHANNEL_ATTEMPTS)
+                        .await
+                    {
+                        Ok(attempts) => {
+                            error!(
+                                "Failed to push {} to channel (attempt {}/{}): {}",
+                                file.name, attempts, MAX_CHANNEL_ATTEMPTS, e
+                            );
+                            if attempts >= MAX_CHANNEL_ATTEMPTS {
+                                let _ = self
+                                    .notifier
+                                    .send_message(format!(
+                                        "⚠️ 频道推送重试 {} 次仍失败，已放弃: <code>{}</code>",
+                                        attempts, file.name
+                                    ))
+                                    .await;
+                            }
+                        }
+                        Err(db_err) => {
+                            error!("Failed to record channel failure {}: {}", file.name, db_err)
+                        }
+                    }
+                }
+            }
+
+            tokio::time::sleep(CHANNEL_SEND_INTERVAL).await;
+        }
+    }
+
+    /// 独立重试上轮遗留的频道推送占位行（不依赖 entry 再次出现在 feed）
+    async fn retry_channel_pending(&self) -> Result<()> {
+        let pending = self.db.list_channel_pending().await?;
+        if pending.is_empty() {
+            return Ok(());
+        }
+        info!("Retrying {} pending channel files", pending.len());
+
+        // 按 entry 分组取作品名，避免重复请求 jimaku
+        let mut entry_cache: std::collections::HashMap<i64, Option<Entry>> =
+            std::collections::HashMap::new();
+        let channel = self.channel.as_ref().expect("channel notifier missing");
+
+        for file in pending {
+            let entry = match entry_cache.get(&file.entry_id) {
+                Some(cached) => cached.as_ref(),
+                None => {
+                    let fetched = self.jimaku.get_entry_by_id(file.entry_id).await.ok();
+                    entry_cache.insert(file.entry_id, fetched);
+                    entry_cache[&file.entry_id].as_ref()
+                }
+            };
+
+            let (ja, en, romaji) = match entry {
+                Some(e) => (
+                    e.japanese_name.clone(),
+                    e.english_name.clone(),
+                    self.resolve_romaji(e).await,
+                ),
+                None => (None, None, file.entry_name.clone()),
+            };
+
+            let sub = ChannelSubtitle {
+                japanese_name: ja.as_deref(),
+                english_name: en.as_deref(),
+                romaji: &romaji,
+                file_name: &file.file_name,
+                file_size: file.file_size.unwrap_or(0),
+                file_url: &file.file_url,
+                entry_id: file.entry_id,
+            };
+
+            let result = if file.file_size.unwrap_or(0) > MAX_DOCUMENT_SIZE {
+                channel.send_text_card(&channel_link_card(&sub)).await
+            } else {
+                match self
+                    .downloader
+                    .download_subtitle(&file.entry_name, &file.file_name, &file.file_url)
+                    .await
+                {
+                    Ok(path) => {
+                        channel
+                            .send_subtitle_document(&path, &channel_caption(&sub))
+                            .await
+                    }
+                    Err(e) => Err(e),
+                }
+            };
+
+            match result {
+                Ok(_) => {
+                    self.db.mark_channel_pushed(file.id).await?;
+                    info!("Channel retry succeeded: {}", file.file_name);
+                }
+                Err(e) => {
+                    let attempts = self
+                        .db
+                        .mark_channel_failed(file.id, MAX_CHANNEL_ATTEMPTS)
+                        .await?;
+                    error!(
+                        "Channel retry failed for {} (attempt {}/{}): {}",
+                        file.file_name, attempts, MAX_CHANNEL_ATTEMPTS, e
+                    );
+                    if attempts >= MAX_CHANNEL_ATTEMPTS {
+                        let _ = self
+                            .notifier
+                            .send_message(format!(
+                                "⚠️ 频道推送重试 {} 次仍失败，已放弃: <code>{}</code>",
+                                attempts, file.file_name
+                            ))
+                            .await;
+                    }
+                }
+            }
+
+            tokio::time::sleep(CHANNEL_SEND_INTERVAL).await;
+        }
+        Ok(())
+    }
+
+    /// 解析作品罗马音：缓存 → AniList API → 降级 entry.name（本身即罗马音）
+    async fn resolve_romaji(&self, entry: &Entry) -> String {
+        if let Some(anilist_id) = entry.anilist_id {
+            match self.db.get_cached_romaji(anilist_id).await {
+                Ok(Some(Some(cached))) => return cached,
+                Ok(Some(None)) => debug!("AniList negative cache hit for {}", anilist_id),
+                Ok(None) => {
+                    let romaji = self.anilist.get_romaji(anilist_id).await;
+                    if let Err(e) = self.db.cache_romaji(anilist_id, romaji.as_deref()).await {
+                        warn!("Failed to cache romaji for {}: {}", anilist_id, e);
+                    }
+                    if let Some(romaji) = romaji {
+                        return romaji;
+                    }
+                }
+                Err(e) => warn!("Failed to read romaji cache: {}", e),
+            }
+        }
+        entry.name.clone()
+    }
+
     /// 通知后把字幕文件作为文档发送到聊天（订阅开启 send_file 时）
     async fn send_subtitle_file(
         &self,
@@ -354,6 +643,38 @@ impl Scheduler {
 const MAX_NOTIFY_ATTEMPTS: i64 = 5;
 const NOTIFY_INTERVAL: Duration = Duration::from_millis(350);
 
+// ---------- 频道推送 ----------
+const MAX_CHANNEL_ATTEMPTS: i64 = 5;
+/// 频道消息限制比私聊严（约 20 条/分钟），发送间隔取 1s
+const CHANNEL_SEND_INTERVAL: Duration = Duration::from_secs(1);
+/// Telegram bot 本地上传上限 50MB，jimaku 自报 size 可能有出入，取保守值
+const MAX_DOCUMENT_SIZE: i64 = 48 * 1024 * 1024;
+
+/// 频道推送对单个文件的处理动作
+#[derive(Debug, PartialEq, Eq)]
+enum ChannelAction {
+    /// 已推送过或已死信：跳过
+    Skip,
+    /// 基线前的 backlog：静默标记，不发频道
+    Silent,
+    /// 新文件：走推送流程
+    Send,
+}
+
+fn channel_file_action(
+    url_known: bool,
+    file_modified: DateTime<Utc>,
+    baseline: DateTime<Utc>,
+) -> ChannelAction {
+    if url_known {
+        return ChannelAction::Skip;
+    }
+    if file_modified < baseline {
+        return ChannelAction::Silent;
+    }
+    ChannelAction::Send
+}
+
 fn file_matches_keywords(file_name: &str, keywords: &[String]) -> bool {
     if keywords.is_empty() {
         return true;
@@ -368,9 +689,35 @@ fn file_matches_keywords(file_name: &str, keywords: &[String]) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::file_matches_keywords;
+    use super::{channel_file_action, file_matches_keywords, ChannelAction};
     use crate::jimaku::{Entry, JimakuClient};
-    use chrono::Utc;
+    use chrono::{Duration, Utc};
+
+    #[test]
+    fn channel_action_matrix() {
+        let baseline = Utc::now();
+        let before = baseline - Duration::hours(1);
+        let after = baseline + Duration::hours(1);
+
+        // 已知 url：一律跳过（无论新旧）
+        assert_eq!(
+            channel_file_action(true, after, baseline),
+            ChannelAction::Skip
+        );
+        assert_eq!(
+            channel_file_action(true, before, baseline),
+            ChannelAction::Skip
+        );
+        // 未知 url：基线前静默，基线后推送
+        assert_eq!(
+            channel_file_action(false, before, baseline),
+            ChannelAction::Silent
+        );
+        assert_eq!(
+            channel_file_action(false, after, baseline),
+            ChannelAction::Send
+        );
+    }
 
     #[test]
     fn empty_file_keyword_does_not_match_every_file() {

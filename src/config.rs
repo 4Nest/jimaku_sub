@@ -18,6 +18,8 @@ pub struct Config {
     pub database: DatabaseConfig,
     #[serde(default = "default_logging")]
     pub logging: LoggingConfig,
+    #[serde(default = "default_channel")]
+    pub channel: ChannelConfig,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -69,6 +71,16 @@ pub struct LoggingConfig {
     pub retention_days: u32,
 }
 
+/// 全量字幕频道推送
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ChannelConfig {
+    #[serde(default = "default_false")]
+    pub enabled: bool,
+    /// 数字频道 id（-100 开头），不支持 @username
+    #[serde(default)]
+    pub chat_id: String,
+}
+
 fn default_jimaku() -> JimakuConfig {
     JimakuConfig {
         api_key: String::new(),
@@ -110,6 +122,13 @@ fn default_logging() -> LoggingConfig {
     LoggingConfig {
         dir: default_log_dir(),
         retention_days: default_log_retention_days(),
+    }
+}
+
+fn default_channel() -> ChannelConfig {
+    ChannelConfig {
+        enabled: false,
+        chat_id: String::new(),
     }
 }
 
@@ -156,6 +175,8 @@ impl Config {
         builder = builder.set_default("database.url", "sqlite://data/jimaku_subscriber.db")?;
         builder = builder.set_default("logging.dir", "./logs")?;
         builder = builder.set_default("logging.retention_days", 30)?;
+        builder = builder.set_default("channel.enabled", false)?;
+        builder = builder.set_default("channel.chat_id", "")?;
 
         // 从配置文件读取
         if Path::new("config.toml").exists() {
@@ -199,6 +220,12 @@ impl Config {
         if let Ok(v) = std::env::var("LOG_RETENTION_DAYS") {
             cfg.logging.retention_days = v.parse().unwrap_or(30);
         }
+        if let Ok(v) = std::env::var("CHANNEL_ENABLED") {
+            cfg.channel.enabled = v.parse().unwrap_or(false);
+        }
+        if let Ok(v) = std::env::var("CHANNEL_CHAT_ID") {
+            cfg.channel.chat_id = v;
+        }
         // 解析逗号分隔的 anilist_ids
         if let Ok(v) = std::env::var("SUBSCRIPTION_ANILIST_IDS") {
             cfg.subscription.anilist_ids = v
@@ -229,6 +256,14 @@ impl Config {
         }
         if self.telegram.chat_id.is_empty() {
             anyhow::bail!("Telegram chat ID is required");
+        }
+        if self.channel.enabled {
+            match self.channel.chat_id.trim().parse::<i64>() {
+                Ok(id) if id < 0 => {}
+                _ => anyhow::bail!(
+                    "CHANNEL_CHAT_ID must be a numeric channel id (-100...) when channel is enabled"
+                ),
+            }
         }
         Ok(())
     }

@@ -4,3 +4,4 @@
 /downloads
 .env
 .DS_Store
+.claude/
