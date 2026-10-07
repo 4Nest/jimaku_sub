@@ -198,24 +198,6 @@ fn md_link(label: &str, url: &str) -> String {
     )
 }
 
-/// 引用块名字行：罗马音 / 英文 / 日语 顺序，去空白并做大小写不敏感去重
-fn name_lines(sub: &ChannelSubtitle<'_>) -> Vec<String> {
-    let mut lines: Vec<String> = Vec::new();
-    let mut seen: Vec<String> = Vec::new();
-    for name in [Some(sub.romaji), sub.english_name, sub.japanese_name] {
-        let Some(name) = name.map(str::trim).filter(|n| !n.is_empty()) else {
-            continue;
-        };
-        let key = name.to_lowercase();
-        if seen.contains(&key) {
-            continue;
-        }
-        seen.push(key);
-        lines.push(name.to_string());
-    }
-    lines
-}
-
 /// 主标题：优先日语名，其次罗马音，再英语名
 fn channel_primary<'a>(sub: &ChannelSubtitle<'a>) -> &'a str {
     sub.japanese_name
@@ -234,10 +216,9 @@ fn channel_primary<'a>(sub: &ChannelSubtitle<'a>) -> &'a str {
 }
 
 /// 频道消息正文（装饰面板风，MarkdownV2）：
-/// ✦ *日语名(链接)* ✦ + 引用块副标题（罗马音/英文）+ 分隔线 + 等宽文件名 + meta 行
+/// ✦ *日语名(链接)* ✦ + 分隔线 + 等宽文件名 + meta 行
 fn channel_body(sub: &ChannelSubtitle<'_>) -> String {
     let primary = channel_primary(sub);
-    let primary_key = primary.to_lowercase();
 
     let mut text = format!(
         "✦ *{}* ✦",
@@ -246,14 +227,6 @@ fn channel_body(sub: &ChannelSubtitle<'_>) -> String {
             &format!("https://jimaku.cc/entry/{}", sub.entry_id)
         )
     );
-
-    for name in name_lines(sub)
-        .into_iter()
-        .filter(|name| name.to_lowercase() != primary_key)
-    {
-        // MarkdownV2 引用块：行首 > 前缀
-        text.push_str(&format!("\n>{}", md_escape(truncate(&name, LINE_LIMIT))));
-    }
 
     text.push_str(&format!(
         "\n──────────────────\n🎞 {}\n📦 {} │ 🕐 {}",
@@ -390,8 +363,10 @@ mod tests {
         let c = channel_caption(&s);
         // 主标题：✦ 装饰 + 日语名粗体 + jimaku 链接
         assert!(c.contains("✦ *[本好きの下剋上 領主の養女](https://jimaku.cc/entry/11783)* ✦"));
-        // 副标题：引用块内 罗马音 / 英文 各一行
-        assert!(c.contains("\n>Honzuki no Gekokujou\n>Ascendance of a Bookworm\n"));
+        // 不展示罗马音/英文副标题，标题行之后直接是分隔线
+        assert!(!c.contains("Honzuki no Gekokujou"));
+        assert!(!c.contains("Ascendance of a Bookworm"));
+        assert!(c.contains("✦\n──────────────────"));
         // 分隔线 + 等宽文件名
         assert!(c.contains("──────────────────\n🎞 `S01E13.WEBRip.TVer.ja[cc].srt`"));
         // meta 行：竖线分隔 + AniList 链接，日期连字符已转义
@@ -402,12 +377,12 @@ mod tests {
     }
 
     #[test]
-    fn caption_dedups_same_names_case_insensitive() {
-        // 英语名与罗马音相同（大小写不同）→ 英文名行被去重
+    fn caption_shows_only_primary_name() {
+        // 无日语名时主标题降级为罗马音，英文名不再单独展示
         let s = sub(None, Some("Yomi no Tsugai"), "yomi no tsugai");
         let c = channel_caption(&s);
-        // 罗马音=主标题（无日语名时），英文名去重后无副标题行
         assert!(c.contains("[yomi no tsugai](https://jimaku.cc/entry/11783)"));
+        // 英文名不展示，罗马音只在主标题出现一次
         let occurrences = c.matches("Yomi no Tsugai").count() + c.matches("yomi no tsugai").count();
         assert_eq!(occurrences, 1);
     }
