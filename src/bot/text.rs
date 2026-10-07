@@ -241,7 +241,23 @@ fn channel_body(sub: &ChannelSubtitle<'_>) -> String {
             md_link("AniList", &format!("https://anilist.co/anime/{}", id))
         ));
     }
+
+    // 日语番名 hashtag：标签只认文字/数字/下划线，空格和标点（！等）会被截断，直接剔除
+    if let Some(tag) = sub
+        .japanese_name
+        .map(sanitize_hashtag)
+        .filter(|t| !t.is_empty())
+    {
+        text.push_str(&format!("\n\\#{}", md_escape(truncate(&tag, LINE_LIMIT))));
+    }
     text
+}
+
+/// 净化 hashtag：仅保留字母数字（含 CJK）和下划线
+fn sanitize_hashtag(name: &str) -> String {
+    name.chars()
+        .filter(|c| c.is_alphanumeric() || *c == '_')
+        .collect()
 }
 
 /// 频道文件消息的 Caption（MarkdownV2，≤1024 字符）
@@ -373,7 +389,28 @@ mod tests {
         assert!(c.contains(
             "📦 44 KB │ 🕐 2026\\-10\\-07 15:20 UTC │ 🎬 [AniList](https://anilist.co/anime/999999)"
         ));
+        // 日语番名 hashtag：空格剔除、不带标点
+        assert!(c.contains("\n\\#本好きの下剋上領主の養女"));
         assert!(!c.contains("下载字幕"));
+    }
+
+    #[test]
+    fn caption_hashtag_strips_punctuation() {
+        let s = sub(Some("生徒会にも穴はある！"), None, "Ro");
+        let c = channel_caption(&s);
+        assert!(
+            c.contains("\n\\#生徒会にも穴はある"),
+            "hashtag 不正确: {}",
+            c
+        );
+        assert!(!c.contains("\\#生徒会にも穴はある！"));
+    }
+
+    #[test]
+    fn caption_omits_hashtag_without_japanese_name() {
+        let s = sub(None, Some("En"), "Ro");
+        let c = channel_caption(&s);
+        assert!(!c.contains("\\#"));
     }
 
     #[test]
