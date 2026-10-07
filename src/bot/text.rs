@@ -167,15 +167,11 @@ fn truncate(s: &str, max: usize) -> &str {
     }
 }
 
-/// 引用块名字行：罗马音 / 英文 顺序，去空白并做大小写不敏感去重
-fn name_lines(sub: &ChannelSubtitle<'_>) -> Vec<(&'static str, String)> {
-    let mut lines: Vec<(&'static str, String)> = Vec::new();
+/// 引用块名字行：罗马音 / 英文 / 日语 顺序，去空白并做大小写不敏感去重
+fn name_lines(sub: &ChannelSubtitle<'_>) -> Vec<String> {
+    let mut lines: Vec<String> = Vec::new();
     let mut seen: Vec<String> = Vec::new();
-    for (emoji, name) in [
-        ("🔤", Some(sub.romaji)),
-        ("🇬🇧", sub.english_name),
-        ("🇯🇵", sub.japanese_name),
-    ] {
+    for name in [Some(sub.romaji), sub.english_name, sub.japanese_name] {
         let Some(name) = name.map(str::trim).filter(|n| !n.is_empty()) else {
             continue;
         };
@@ -184,7 +180,7 @@ fn name_lines(sub: &ChannelSubtitle<'_>) -> Vec<(&'static str, String)> {
             continue;
         }
         seen.push(key);
-        lines.push((emoji, name.to_string()));
+        lines.push(name.to_string());
     }
     lines
 }
@@ -219,8 +215,8 @@ fn channel_header(sub: &ChannelSubtitle<'_>) -> (String, String) {
 
     let quote_lines: Vec<String> = name_lines(sub)
         .into_iter()
-        .filter(|(_, name)| name.to_lowercase() != primary_key)
-        .map(|(emoji, name)| format!("{} {}", emoji, html_escape(truncate(&name, LINE_LIMIT))))
+        .filter(|name| name.to_lowercase() != primary_key)
+        .map(|name| html_escape(truncate(&name, LINE_LIMIT)))
         .collect();
     let quote = if quote_lines.is_empty() {
         String::new()
@@ -380,10 +376,10 @@ mod tests {
         assert!(c.contains(
             "📺 <b><a href=\"https://jimaku.cc/entry/11783\">本好きの下剋上 領主の養女</a></b>"
         ));
-        // 引用块：罗马音 / 英文
-        assert!(c.contains(
-            "<blockquote>🔤 Honzuki no Gekokujou\n🇬🇧 Ascendance of a Bookworm</blockquote>"
-        ));
+        // 引用块：罗马音 / 英文（无 emoji 前缀）
+        assert!(
+            c.contains("<blockquote>Honzuki no Gekokujou\nAscendance of a Bookworm</blockquote>")
+        );
         // 元信息行：大小 · 时间 · AniList 文字链接
         assert!(c.contains(
             "📦 44 KB · 🕐 2026-10-07 15:20 UTC · 🎬 <a href=\"https://anilist.co/anime/999999\">AniList</a>"
@@ -397,9 +393,8 @@ mod tests {
         // 英语名与罗马音相同（大小写不同）→ 英文名行被去重
         let s = sub(None, Some("Yomi no Tsugai"), "yomi no tsugai");
         let c = channel_caption(&s);
-        assert!(!c.contains("🇬🇧"), "英文行应被去重: {}", c);
+        // 罗马音=主标题（无日语名时），英文名去重后引用块为空
         assert!(c.contains(">yomi no tsugai</a></b>"));
-        // 罗马音=主标题（无日语名时），引用块为空
         assert!(!c.contains("<blockquote>"));
     }
 
@@ -416,7 +411,7 @@ mod tests {
         let s = sub(None, None, "Only Romaji");
         let c = channel_caption(&s);
         assert!(c.contains(">Only Romaji</a></b>"));
-        assert!(!c.contains("🇯🇵") && !c.contains("🇬🇧"));
+        assert!(!c.contains("<blockquote>"));
     }
 
     #[test]
