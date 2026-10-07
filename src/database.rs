@@ -518,3 +518,118 @@ fn parse_keywords(value: Option<&str>) -> Vec<String> {
         .and_then(|raw| serde_json::from_str::<Vec<String>>(raw).ok())
         .unwrap_or_default()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::Database;
+
+    fn temp_db_url(tag: &str) -> (String, std::path::PathBuf) {
+        let dir =
+            std::env::temp_dir().join(format!("jimaku-test-{}-{}", tag, uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let url = format!("sqlite://{}/test.db", dir.display());
+        (url, dir)
+    }
+
+    #[tokio::test]
+    async fn migrates_and_roundtrips() {
+        let (url, dir) = temp_db_url("fresh");
+        let db = Database::new(&url).await.unwrap();
+
+        // 占位-确认通知流程
+        let id = db
+            .upsert_pending_file(1, "entry", "file.ass", "http://x/f", Some(10), false)
+            .await
+            .unwrap();
+        assert!(!db.is_file_notified("http://x/f").await.unwrap());
+        db.mark_notified(id).await.unwrap();
+        assert!(db.is_file_notified("http://x/f").await.unwrap());
+        assert_eq!(
+            db.get_notified_file_by_id(id)
+                .await
+                .unwrap()
+                .unwrap()
+                .entry_id,
+            1
+        );
+
+        // 失败重试达到上限转死信
+        let id2 = db
+            .upsert_pending_file(1, "entry", "dead.ass", "http://x/d", None, false)
+            .await
+            .unwrap();
+        for _ in 0..5 {
+            db.mark_notify_failed(id2, 5).await.unwrap();
+        }
+        // 死信行不再被 upsert 复活为待通知
+        db.upsert_pending_file(1, "entry", "dead.ass", "http://x/d", None, false)
+            .await
+            .unwrap();
+        assert!(!db.is_file_notified("http://x/d").await.unwrap());
+
+        // 订阅策略
+        db.add_subscription_details(1, Some("title"), &[])
+            .await
+            .unwrap();
+        let sub = db.get_subscription(1).await.unwrap().unwrap();
+        assert!(!sub.muted && !sub.send_file && sub.auto_download.is_none());
+        db.save_subscription_policy(1, true, Some(true), true)
+            .await
+            .unwrap();
+        let sub = db.get_subscription(1).await.unwrap().unwrap();
+        assert!(sub.muted && sub.send_file && sub.auto_download == Some(true));
+
+        // 暂存搜索
+        db.create_pending_search("tok12345", 99, &["NF".to_string()], &[1, 2])
+            .await
+            .unwrap();
+        let pending = db.get_pending_search("tok12345").await.unwrap().unwrap();
+        assert_eq!(pending.chat_id, 99);
+        assert_eq!(pending.entry_ids, vec![1, 2]);
+        db.delete_pending_search("tok12345").await.unwrap();
+        assert!(db.get_pending_search("tok12345").await.unwrap().is_none());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 模拟生产库的旧表结构（无 notified/attempts 列），迁移后历史行必须保持「已通知」
+    #[tokio::test]
+    async fn migrates_legacy_schema_without_renotify() {
+        use std::str::FromStr;
+        let (url, dir) = temp_db_url("legacy");
+
+        // 用旧结构先建库并插入一条历史通知记录
+        let options = sqlx::sqlite::SqliteConnectOptions::from_str(&url)
+            .unwrap()
+            .create_if_missing(true);
+        let pool = sqlx::SqlitePool::connect_with(options).await.unwrap();
+        sqlx::query(
+            "CREATE TABLE notified_files (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                entry_id INTEGER NOT NULL,
+                entry_name TEXT NOT NULL,
+                file_name TEXT NOT NULL,
+                file_url TEXT NOT NULL UNIQUE,
+                file_size INTEGER,
+                notified_at TEXT NOT NULL,
+                downloaded INTEGER DEFAULT 0
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO notified_files (entry_id, entry_name, file_name, file_url, notified_at)
+             VALUES (1, 'e', 'old.ass', 'http://x/old', '2026-05-01T00:00:00+00:00')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        pool.close().await;
+
+        let db = Database::new(&url).await.unwrap();
+        assert!(db.is_file_notified("http://x/old").await.unwrap());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}

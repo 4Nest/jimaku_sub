@@ -4,12 +4,15 @@
 
 ## 功能特性
 
-- 🔔 **新字幕通知** — 定时检查 jimaku.cc 新上传的字幕，通过 Telegram 推送
+- 🔔 **新字幕通知** — 定时检查 jimaku.cc 新上传的字幕，通过 Telegram 推送富文本卡片（语言、大小、时间、链接）
+- 📄 **一键发送文件** — 通知卡片带「⬇️ 下载」按钮，点击直接把字幕文件发到聊天
 - ⬇️ **自动下载** — 可选自动下载字幕文件到指定目录
 - 🎯 **精准订阅** — 支持按 Jimaku Entry ID、作品名和文件关键词过滤字幕
-- 🤖 **Bot 交互** — 支持 Telegram 命令动态管理订阅
+- 🤖 **Bot 交互** — Telegram 命令 + inline 按钮管理订阅（搜索结果点选、静音/退订按钮）
+- 🎚️ **订阅级策略** — 每个订阅单独设置静音、自动下载（跟随全局/开/关）、通知后发送文件
 - 🔒 **命令白名单** — 只允许配置的 `TELEGRAM_CHAT_ID` 执行 Bot 命令
-- 🗄️ **状态持久化** — SQLite 存储已通知记录，重启不重复推送
+- 🗄️ **状态持久化** — SQLite 存储已通知记录，重启不重复推送；通知发送失败自动下轮重试
+- 🛡️ **稳定运行** — 优雅停机、崩溃自动重启、Docker 健康检查、Telegram 限流退避、日志按天轮转+定期清理
 - 🐳 **Docker 部署** — 一键容器化运行
 
 ## Telegram Bot 命令
@@ -21,10 +24,16 @@
 | `/checknow` | 立即触发一次检查 |
 | `/download <entry_id>` | 下载指定 Jimaku Entry 的全部字幕，跳过已下载文件 |
 | `/sub <entry_id>` | 按 Jimaku Entry ID 添加订阅 |
-| `/sub <作品名>` | 搜索 Jimaku 并添加作品订阅 |
+| `/sub <作品名>` | 搜索 Jimaku，多个结果时用按钮点选订阅 |
 | `/sub <作品名> -r NF\|Netflix\|ATX` | 只通知文件名匹配这些关键词的字幕 |
 | `/unsub <作品名\|entry_id>` | 取消订阅 |
-| `/listsubs` | 列出当前动态订阅 |
+| `/listsubs` | 列出当前动态订阅（每个订阅带管理按钮面板） |
+
+## 按钮交互
+
+- **通知卡片**：「⬇️ 下载字幕文件」— 把字幕文件作为文档发送到聊天（本地已有直接发，否则现下载）
+- **/sub 多结果**：候选作品列表按钮，点击即订阅，附带策略面板
+- **/listsubs 面板**：`🔇/🔔 静音`、`📥 自动下载（跟随全局→开→关）`、`📄 发文件`、`❌ 退订（二次确认）`
 
 ## 快速开始
 
@@ -56,6 +65,9 @@ docker compose up -d
 | `DOWNLOAD_ENABLED` | ❌ | 是否自动下载 (`true`/`false`) |
 | `DOWNLOAD_PATH` | ❌ | 下载路径 (默认 `/app/downloads`) |
 | `SCHEDULER_INTERVAL_SECONDS` | ❌ | 检查间隔秒数 (默认 `300`) |
+| `DATABASE_URL` | ❌ | SQLite 路径 (默认 `sqlite://data/jimaku_subscriber.db`，compose 中指向 `/app/data`) |
+| `LOG_RETENTION_DAYS` | ❌ | 日志保留天数 (默认 `30`) |
+| `RUST_LOG` | ❌ | 日志级别 (默认 `info,teloxide=warn`) |
 | `SUBSCRIPTION_ANILIST_IDS` | ❌ | 订阅的 AniList ID，逗号分隔 |
 | `SUBSCRIPTION_NAME_KEYWORDS` | ❌ | 订阅关键词，逗号分隔 |
 
@@ -81,6 +93,13 @@ download_path = "/app/downloads"
 
 [scheduler]
 interval_seconds = 300
+
+[database]
+url = "sqlite://data/jimaku_subscriber.db"
+
+[logging]
+dir = "./logs"
+retention_days = 30
 ```
 
 挂载到容器：
@@ -103,12 +122,18 @@ volumes:
 .
 ├── data/              # SQLite 数据库持久化
 ├── downloads/         # 字幕下载目录（如启用）
-├── logs/              # 应用日志
+├── logs/              # 应用日志（按天轮转，自动清理）
 ├── src/
-│   ├── main.rs        # 入口
+│   ├── main.rs        # 入口：配置、日志、组件装配、任务监督
+│   ├── bot/
+│   │   ├── mod.rs     # AppState 与公共逻辑
+│   │   ├── commands.rs   # Bot 命令 handler
+│   │   ├── callbacks.rs  # inline 按钮回调
+│   │   ├── keyboards.rs  # 按钮面板与 callback_data 编解码
+│   │   └── text.rs       # 消息模板
 │   ├── config.rs      # 配置管理
 │   ├── jimaku.rs      # Jimaku API 客户端
-│   ├── telegram.rs    # Telegram 通知
+│   ├── telegram.rs    # Telegram 通知（限流）
 │   ├── database.rs    # SQLite 存储
 │   ├── scheduler.rs   # 定时轮询
 │   └── downloader.rs  # 字幕下载
