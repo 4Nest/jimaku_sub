@@ -167,6 +167,35 @@ fn truncate(s: &str, max: usize) -> &str {
     }
 }
 
+// ---------- MarkdownV2 工具（频道推送使用） ----------
+
+/// MarkdownV2 普通文本转义：_*[]()~`>#+-=|{}.! 全部加反斜杠
+fn md_escape(text: &str) -> String {
+    text.chars()
+        .flat_map(|c| {
+            if "_*[]()~`>#+-=|{}.!".contains(c) {
+                vec!['\\', c]
+            } else {
+                vec![c]
+            }
+        })
+        .collect()
+}
+
+/// MarkdownV2 等宽行内代码：只需转义反斜杠和反引号
+fn md_code(text: &str) -> String {
+    format!("`{}`", text.replace('\\', "\\\\").replace('`', "\\`"))
+}
+
+/// MarkdownV2 文字链接
+fn md_link(label: &str, url: &str) -> String {
+    format!(
+        "[{}]({})",
+        md_escape(label),
+        url.replace('\\', "\\\\").replace(')', "\\)")
+    )
+}
+
 /// 引用块名字行：罗马音 / 英文 / 日语 顺序，去空白并做大小写不敏感去重
 fn name_lines(sub: &ChannelSubtitle<'_>) -> Vec<String> {
     let mut lines: Vec<String> = Vec::new();
@@ -202,58 +231,46 @@ fn channel_primary<'a>(sub: &ChannelSubtitle<'a>) -> &'a str {
         .unwrap_or("未知作品")
 }
 
-/// 标题 + 引用块（方案 A · 引用块杂志风）。
-/// 返回 (标题行, 引用块) ；引用块为主标题之外的名字行，为空则不渲染。
-fn channel_header(sub: &ChannelSubtitle<'_>) -> (String, String) {
+/// 频道消息正文（装饰面板风，MarkdownV2）：
+/// ✦ *日语名(链接)* ✦ + 副标题名字行 + 分隔线 + 等宽文件名 + meta 行
+fn channel_body(sub: &ChannelSubtitle<'_>) -> String {
     let primary = channel_primary(sub);
     let primary_key = primary.to_lowercase();
-    let title = format!(
-        "📺 <b><a href=\"https://jimaku.cc/entry/{}\">{}</a></b>",
-        sub.entry_id,
-        html_escape(truncate(primary, LINE_LIMIT))
+
+    let mut text = format!(
+        "✦ *{}* ✦",
+        md_link(
+            truncate(primary, LINE_LIMIT),
+            &format!("https://jimaku.cc/entry/{}", sub.entry_id)
+        )
     );
 
-    let quote_lines: Vec<String> = name_lines(sub)
+    for name in name_lines(sub)
         .into_iter()
         .filter(|name| name.to_lowercase() != primary_key)
-        .map(|name| html_escape(truncate(&name, LINE_LIMIT)))
-        .collect();
-    let quote = if quote_lines.is_empty() {
-        String::new()
-    } else {
-        format!("<blockquote>{}</blockquote>", quote_lines.join("\n"))
-    };
-    (title, quote)
-}
+    {
+        text.push_str(&format!("\n{}", md_escape(truncate(&name, LINE_LIMIT))));
+    }
 
-/// meta 行：大小 · 时间 · AniList 文字链接（有 id 时）
-fn channel_meta(sub: &ChannelSubtitle<'_>) -> String {
-    let mut meta = format!(
-        "📦 {} · 🕐 {}",
-        format_size(sub.file_size),
-        sub.file_modified.format("%Y-%m-%d %H:%M UTC")
-    );
+    text.push_str(&format!(
+        "\n──────────────────\n🎞 {}\n📦 {} │ 🕐 {}",
+        md_code(truncate(sub.file_name, LINE_LIMIT)),
+        md_escape(&format_size(sub.file_size)),
+        md_escape(&sub.file_modified.format("%Y-%m-%d %H:%M UTC").to_string())
+    ));
+
     if let Some(id) = sub.anilist_id {
-        meta.push_str(&format!(
-            " · 🎬 <a href=\"https://anilist.co/anime/{}\">AniList</a>",
-            id
+        text.push_str(&format!(
+            " │ 🎬 {}",
+            md_link("AniList", &format!("https://anilist.co/anime/{}", id))
         ));
     }
-    meta
+    text
 }
 
-/// 频道文件消息的 Caption（HTML，≤1024 字符）
+/// 频道文件消息的 Caption（MarkdownV2，≤1024 字符）
 pub fn channel_caption(sub: &ChannelSubtitle<'_>) -> String {
-    let (title, quote) = channel_header(sub);
-    let mut text = title;
-    if !quote.is_empty() {
-        text.push_str(&format!("\n{}\n", quote));
-    }
-    text.push_str(&format!(
-        "\n📝 <code>{}</code>\n{}",
-        html_escape(truncate(sub.file_name, LINE_LIMIT)),
-        channel_meta(sub)
-    ));
+    let text = channel_body(sub);
     // Telegram 上限按字符计（Rust len() 是字节数，CJK 会虚高 3 倍）
     debug_assert!(
         text.chars().count() <= CAPTION_LIMIT,
@@ -265,17 +282,11 @@ pub fn channel_caption(sub: &ChannelSubtitle<'_>) -> String {
 
 /// 超过发送上限的文件：频道文字卡片（下载走消息下方 URL 按钮）
 pub fn channel_link_card(sub: &ChannelSubtitle<'_>) -> String {
-    let (title, quote) = channel_header(sub);
-    let mut text = title;
-    if !quote.is_empty() {
-        text.push_str(&format!("\n{}\n", quote));
-    }
-    text.push_str(&format!(
-        "\n📝 <code>{}</code>\n{}\n⚠️ 文件超过发送上限，请用下方按钮下载",
-        html_escape(sub.file_name),
-        channel_meta(sub)
-    ));
-    text
+    format!(
+        "{}\n⚠️ {}",
+        channel_body(sub),
+        md_escape("文件超过发送上限，请用下方按钮下载")
+    )
 }
 
 pub fn display_entry_title(entry: &Entry) -> String {
@@ -365,26 +376,23 @@ mod tests {
     }
 
     #[test]
-    fn caption_magazine_layout_with_quote_block() {
+    fn caption_panel_layout_markdown() {
         let s = sub(
             Some("本好きの下剋上 領主の養女"),
             Some("Ascendance of a Bookworm"),
             "Honzuki no Gekokujou",
         );
         let c = channel_caption(&s);
-        // 主标题：日语名粗体 + 跳转 jimaku 作品页
+        // 主标题：✦ 装饰 + 日语名粗体 + jimaku 链接
+        assert!(c.contains("✦ *[本好きの下剋上 領主の養女](https://jimaku.cc/entry/11783)* ✦"));
+        // 副标题：罗马音 / 英文 各一行（无 emoji 前缀）
+        assert!(c.contains("\nHonzuki no Gekokujou\nAscendance of a Bookworm\n"));
+        // 分隔线 + 等宽文件名
+        assert!(c.contains("──────────────────\n🎞 `S01E13.WEBRip.TVer.ja[cc].srt`"));
+        // meta 行：竖线分隔 + AniList 链接，日期连字符已转义
         assert!(c.contains(
-            "📺 <b><a href=\"https://jimaku.cc/entry/11783\">本好きの下剋上 領主の養女</a></b>"
+            "📦 44 KB │ 🕐 2026\\-10\\-07 15:20 UTC │ 🎬 [AniList](https://anilist.co/anime/999999)"
         ));
-        // 引用块：罗马音 / 英文（无 emoji 前缀）
-        assert!(
-            c.contains("<blockquote>Honzuki no Gekokujou\nAscendance of a Bookworm</blockquote>")
-        );
-        // 元信息行：大小 · 时间 · AniList 文字链接
-        assert!(c.contains(
-            "📦 44 KB · 🕐 2026-10-07 15:20 UTC · 🎬 <a href=\"https://anilist.co/anime/999999\">AniList</a>"
-        ));
-        // Caption 里不放文字下载链接（走 URL 按钮）
         assert!(!c.contains("下载字幕"));
     }
 
@@ -393,25 +401,26 @@ mod tests {
         // 英语名与罗马音相同（大小写不同）→ 英文名行被去重
         let s = sub(None, Some("Yomi no Tsugai"), "yomi no tsugai");
         let c = channel_caption(&s);
-        // 罗马音=主标题（无日语名时），英文名去重后引用块为空
-        assert!(c.contains(">yomi no tsugai</a></b>"));
-        assert!(!c.contains("<blockquote>"));
+        // 罗马音=主标题（无日语名时），英文名去重后无副标题行
+        assert!(c.contains("[yomi no tsugai](https://jimaku.cc/entry/11783)"));
+        let occurrences = c.matches("Yomi no Tsugai").count() + c.matches("yomi no tsugai").count();
+        assert_eq!(occurrences, 1);
     }
 
     #[test]
     fn caption_all_names_same_keeps_title_only() {
         let s = sub(Some("Same Name"), Some("Same Name"), "same name");
         let c = channel_caption(&s);
-        assert!(c.contains(">Same Name</a></b>"));
-        assert!(!c.contains("<blockquote>"));
+        assert!(c.contains("[Same Name](https://jimaku.cc/entry/11783)"));
+        // 副标题区为空：标题行之后直接是分隔线
+        assert!(c.contains("✦\n──────────────────"));
     }
 
     #[test]
     fn caption_handles_missing_names() {
         let s = sub(None, None, "Only Romaji");
         let c = channel_caption(&s);
-        assert!(c.contains(">Only Romaji</a></b>"));
-        assert!(!c.contains("<blockquote>"));
+        assert!(c.contains("[Only Romaji](https://jimaku.cc/entry/11783)"));
     }
 
     #[test]
@@ -442,10 +451,19 @@ mod tests {
     }
 
     #[test]
-    fn caption_escapes_html() {
-        let s = sub(None, Some("A & B <C>"), "A & B <C>");
+    fn caption_escapes_markdown_special_chars() {
+        // 括号、点、方括号等 MarkdownV2 特殊字符必须转义
+        let s = sub(None, Some("Show (2026). Ver2"), "Show (2026). Ver2");
         let c = channel_caption(&s);
-        assert!(c.contains("A &amp; B &lt;C&gt;"));
+        assert!(c.contains("Show \\(2026\\)\\. Ver2"), "未正确转义: {}", c);
+    }
+
+    #[test]
+    fn code_span_keeps_punctuation_unescaped() {
+        // 等宽代码内只需转义反引号和反斜杠，. 和 [] 原样保留
+        let s = sub(None, None, "Ro");
+        let c = channel_caption(&s);
+        assert!(c.contains("`S01E13.WEBRip.TVer.ja[cc].srt`"));
     }
 
     #[test]
@@ -454,6 +472,6 @@ mod tests {
         let c = channel_link_card(&s);
         assert!(c.contains("jimaku.cc/entry/11783"));
         assert!(c.contains("超过发送上限"));
-        assert!(c.contains("<blockquote>"));
+        assert!(c.contains("──────────────────"));
     }
 }

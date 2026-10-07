@@ -53,7 +53,7 @@ async fn main() -> Result<()> {
         let channel = ChannelNotifier::new(notifier.bot(), &config.channel.chat_id)
             .context("Failed to create channel notifier")?;
         channel
-            .send_text_card("📡 <b>全量字幕推送已开启</b>\n本频道将接收 jimaku 全站新字幕文件")
+            .send_text_card("📡 *全量字幕推送已开启*\n本频道将接收 jimaku 全站新字幕文件")
             .await
             .context("Failed to send channel startup message (bot 是否已加为频道管理员?)")?;
         info!("Channel full-feed push enabled: {}", config.channel.chat_id);
