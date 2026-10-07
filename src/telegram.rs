@@ -105,42 +105,26 @@ impl ChannelNotifier {
         })
     }
 
-    /// 发送字幕文件到频道，Caption 为 MarkdownV2（≤1024 字符），附 URL 跳转按钮
+    /// 发送字幕文件到频道，Caption 为 MarkdownV2（≤1024 字符）
     pub async fn send_subtitle_document(
         &self,
         path: &std::path::Path,
         caption: &str,
-        keyboard: teloxide::types::InlineKeyboardMarkup,
     ) -> Result<()> {
         self.bot
             .send_document(self.chat_id, teloxide::types::InputFile::file(path))
             .caption(caption)
             .parse_mode(ParseMode::MarkdownV2)
-            .reply_markup(keyboard)
             .await?;
         info!("Channel document sent: {:?}", path);
         Ok(())
     }
 
-    /// 发送文字卡片到频道（MarkdownV2，启动确认等）
+    /// 发送文字卡片到频道（MarkdownV2，启动确认、超大文件的链接卡片等）
     pub async fn send_text_card(&self, text: &str) -> Result<()> {
         self.bot
             .send_message(self.chat_id, text)
             .parse_mode(ParseMode::MarkdownV2)
-            .await?;
-        Ok(())
-    }
-
-    /// 发送带 URL 按钮的文字卡片到频道（MarkdownV2，超大文件的链接卡片）
-    pub async fn send_text_card_with_keyboard(
-        &self,
-        text: &str,
-        keyboard: teloxide::types::InlineKeyboardMarkup,
-    ) -> Result<()> {
-        self.bot
-            .send_message(self.chat_id, text)
-            .parse_mode(ParseMode::MarkdownV2)
-            .reply_markup(keyboard)
             .await?;
         Ok(())
     }

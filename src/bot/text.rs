@@ -153,6 +153,8 @@ pub struct ChannelSubtitle<'a> {
     pub romaji: &'a str,
     pub file_name: &'a str,
     pub file_size: i64,
+    /// jimaku 下载直链（仅超大文件链接卡片使用）
+    pub file_url: &'a str,
     pub entry_id: i64,
     /// 有 id 时在 meta 行附加 AniList 文字链接
     pub anilist_id: Option<i32>,
@@ -280,12 +282,13 @@ pub fn channel_caption(sub: &ChannelSubtitle<'_>) -> String {
     text
 }
 
-/// 超过发送上限的文件：频道文字卡片（下载走消息下方 URL 按钮）
+/// 超过发送上限的文件：频道文字卡片（附 jimaku 下载直链）
 pub fn channel_link_card(sub: &ChannelSubtitle<'_>) -> String {
     format!(
-        "{}\n⚠️ {}",
+        "{}\n⚠️ {}：{}",
         channel_body(sub),
-        md_escape("文件超过发送上限，请用下方按钮下载")
+        md_escape("文件超过发送上限，请从 jimaku 下载"),
+        md_link("点击下载", sub.file_url)
     )
 }
 
@@ -351,6 +354,7 @@ mod tests {
             file_name: "S01E13.WEBRip.TVer.ja[cc].srt",
             file_size: 45_000,
             entry_id: 11783,
+            file_url: "https://jimaku.cc/file/1",
             anilist_id: Some(999999),
             file_modified: chrono::DateTime::parse_from_rfc3339("2026-10-07T15:20:00+00:00")
                 .unwrap()
@@ -443,6 +447,7 @@ mod tests {
             file_name: &long,
             file_size: 1,
             entry_id: 1,
+            file_url: "https://jimaku.cc/file/1",
             anilist_id: Some(1),
             file_modified: chrono::Utc::now(),
         };

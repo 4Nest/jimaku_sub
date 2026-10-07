@@ -416,15 +416,12 @@ impl Scheduler {
                 file_name: &file.name,
                 file_size: file.size,
                 entry_id: entry.id,
+                file_url: &file.url,
                 anilist_id: entry.anilist_id,
                 file_modified: file.last_modified,
             };
-            let keyboard = crate::bot::keyboards::channel_keyboard(&file.url);
-
             let result = if file.size > MAX_DOCUMENT_SIZE {
-                channel
-                    .send_text_card_with_keyboard(&channel_link_card(&sub), keyboard)
-                    .await
+                channel.send_text_card(&channel_link_card(&sub)).await
             } else {
                 match self
                     .downloader
@@ -433,7 +430,7 @@ impl Scheduler {
                 {
                     Ok(path) => {
                         channel
-                            .send_subtitle_document(&path, &channel_caption(&sub), keyboard)
+                            .send_subtitle_document(&path, &channel_caption(&sub))
                             .await
                     }
                     Err(e) => Err(e),
@@ -518,16 +515,13 @@ impl Scheduler {
                 file_name: &file.file_name,
                 file_size: file.file_size.unwrap_or(0),
                 entry_id: file.entry_id,
+                file_url: &file.file_url,
                 anilist_id: entry.and_then(|e| e.anilist_id),
                 // 占位行未存文件时间，重试用当前时间近似
                 file_modified: Utc::now(),
             };
-            let keyboard = crate::bot::keyboards::channel_keyboard(&file.file_url);
-
             let result = if file.file_size.unwrap_or(0) > MAX_DOCUMENT_SIZE {
-                channel
-                    .send_text_card_with_keyboard(&channel_link_card(&sub), keyboard)
-                    .await
+                channel.send_text_card(&channel_link_card(&sub)).await
             } else {
                 match self
                     .downloader
@@ -536,7 +530,7 @@ impl Scheduler {
                 {
                     Ok(path) => {
                         channel
-                            .send_subtitle_document(&path, &channel_caption(&sub), keyboard)
+                            .send_subtitle_document(&path, &channel_caption(&sub))
                             .await
                     }
                     Err(e) => Err(e),

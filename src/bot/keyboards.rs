@@ -61,17 +61,6 @@ pub fn download_keyboard(file_id: i64) -> InlineKeyboardMarkup {
     )]])
 }
 
-/// 频道消息的 URL 跳转按钮：字幕下载直链
-/// URL 按钮无需回调权限，频道成员都可点击
-pub fn channel_keyboard(file_url: &str) -> InlineKeyboardMarkup {
-    InlineKeyboardMarkup::new(vec![vec![InlineKeyboardButton::url(
-        "⬇️ 下载字幕",
-        reqwest::Url::parse(file_url).unwrap_or_else(|_| {
-            reqwest::Url::parse("https://jimaku.cc").expect("fallback url is valid")
-        }),
-    )]])
-}
-
 /// /sub 搜索结果的候选列表按钮
 pub fn entry_selection_keyboard(token: &str, entries: &[Entry]) -> InlineKeyboardMarkup {
     let mut rows: Vec<Vec<InlineKeyboardButton>> = entries
