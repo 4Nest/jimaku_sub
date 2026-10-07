@@ -25,20 +25,20 @@ impl Scheduler {
         jimaku: JimakuClient,
         db: Arc<Database>,
         notifier: TelegramNotifier,
-    ) -> Result<Self> {
+    ) -> Self {
         let downloader = if config.download.enabled {
             Some(Downloader::new(&config.download.download_path))
         } else {
             None
         };
 
-        Ok(Self {
+        Self {
             config,
             jimaku,
             db,
             notifier,
             downloader,
-        })
+        }
     }
 
     pub async fn run(self: Arc<Self>, cancel: CancellationToken) -> Result<()> {
