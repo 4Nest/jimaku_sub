@@ -15,8 +15,13 @@ pub struct DownloadOutcome {
 
 impl Downloader {
     pub fn new(download_path: impl Into<PathBuf>) -> Self {
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(60))
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
         Self {
-            client: reqwest::Client::new(),
+            client,
             download_path: download_path.into(),
         }
     }

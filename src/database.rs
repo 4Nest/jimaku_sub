@@ -94,6 +94,12 @@ impl Database {
         self.ensure_column("subscriptions", "title", "TEXT").await?;
         self.ensure_column("subscriptions", "keywords", "TEXT NOT NULL DEFAULT '[]'")
             .await?;
+        // notified: 1=已通知, 0=待通知(占位), -1=死信(重试耗尽)
+        // 历史行默认 1，避免升级后重复推送
+        self.ensure_column("notified_files", "notified", "INTEGER NOT NULL DEFAULT 1")
+            .await?;
+        self.ensure_column("notified_files", "attempts", "INTEGER NOT NULL DEFAULT 0")
+            .await?;
 
         info!("Database migration completed");
         Ok(())
@@ -141,12 +147,74 @@ impl Database {
     }
 
     pub async fn is_file_notified(&self, file_url: &str) -> Result<bool> {
-        let count: (i64,) =
-            sqlx::query_as("SELECT COUNT(*) FROM notified_files WHERE file_url = ?")
-                .bind(file_url)
-                .fetch_one(&self.pool)
-                .await?;
+        let count: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM notified_files WHERE file_url = ? AND notified = 1",
+        )
+        .bind(file_url)
+        .fetch_one(&self.pool)
+        .await?;
         Ok(count.0 > 0)
+    }
+
+    /// 插入/更新占位行（notified=0），返回行 id。
+    /// 已死信(-1)的行保持死信状态，不再重试。
+    pub async fn upsert_pending_file(
+        &self,
+        entry_id: i64,
+        entry_name: &str,
+        file_name: &str,
+        file_url: &str,
+        file_size: Option<i64>,
+        downloaded: bool,
+    ) -> Result<i64> {
+        let row: (i64,) = sqlx::query_as(
+            "INSERT INTO notified_files
+             (entry_id, entry_name, file_name, file_url, file_size, notified_at, downloaded, notified, attempts)
+             VALUES (?, ?, ?, ?, ?, ?, ?, 0, 0)
+             ON CONFLICT(file_url) DO UPDATE SET
+                entry_id = excluded.entry_id,
+                entry_name = excluded.entry_name,
+                file_name = excluded.file_name,
+                file_size = COALESCE(excluded.file_size, notified_files.file_size),
+                downloaded = MAX(notified_files.downloaded, excluded.downloaded),
+                notified = CASE WHEN notified_files.notified = -1 THEN -1 ELSE 0 END
+             RETURNING id",
+        )
+        .bind(entry_id)
+        .bind(entry_name)
+        .bind(file_name)
+        .bind(file_url)
+        .bind(file_size)
+        .bind(Utc::now().to_rfc3339())
+        .bind(if downloaded { 1 } else { 0 })
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(row.0)
+    }
+
+    pub async fn mark_notified(&self, id: i64) -> Result<()> {
+        sqlx::query("UPDATE notified_files SET notified = 1, notified_at = ? WHERE id = ?")
+            .bind(Utc::now().to_rfc3339())
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// 记录一次通知失败，返回当前失败次数；达到上限后转为死信(notified=-1)。
+    pub async fn mark_notify_failed(&self, id: i64, max_attempts: i64) -> Result<i64> {
+        let row: (i64,) = sqlx::query_as(
+            "UPDATE notified_files
+             SET attempts = attempts + 1,
+                 notified = CASE WHEN attempts + 1 >= ? THEN -1 ELSE notified END
+             WHERE id = ?
+             RETURNING attempts",
+        )
+        .bind(max_attempts)
+        .bind(id)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(row.0)
     }
 
     pub async fn is_file_downloaded(&self, file_url: &str) -> Result<bool> {
@@ -170,8 +238,8 @@ impl Database {
     ) -> Result<()> {
         sqlx::query(
             "INSERT INTO notified_files
-             (entry_id, entry_name, file_name, file_url, file_size, notified_at, downloaded)
-             VALUES (?, ?, ?, ?, ?, ?, ?)
+             (entry_id, entry_name, file_name, file_url, file_size, notified_at, downloaded, notified)
+             VALUES (?, ?, ?, ?, ?, ?, ?, 1)
              ON CONFLICT(file_url) DO UPDATE SET
                 entry_id = excluded.entry_id,
                 entry_name = excluded.entry_name,

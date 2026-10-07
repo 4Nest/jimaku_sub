@@ -12,7 +12,8 @@ chrono = { version = "0.4", features = ["serde"] }
 config = "0.15"
 toml = "0.8"
 sqlx = { version = "0.8", features = ["runtime-tokio-native-tls", "sqlite", "migrate", "chrono"] }
-teloxide = { version = "0.13", features = ["macros"] }
+teloxide = { version = "0.13", features = ["macros", "throttle"] }
+tokio-util = "0.7"
 tracing = "0.1"
 tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }

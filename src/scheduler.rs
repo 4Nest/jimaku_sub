@@ -3,11 +3,12 @@ use crate::{
     database::Database,
     downloader::Downloader,
     jimaku::{Entry, JimakuClient},
-    telegram::TelegramNotifier,
+    telegram::{NewSubtitle, TelegramNotifier},
 };
 use anyhow::Result;
 use std::sync::Arc;
 use tokio::time::{interval, Duration};
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 pub struct Scheduler {
@@ -40,7 +41,7 @@ impl Scheduler {
         })
     }
 
-    pub async fn run(self: Arc<Self>) -> Result<()> {
+    pub async fn run(self: Arc<Self>, cancel: CancellationToken) -> Result<()> {
         let mut ticker = interval(Duration::from_secs(self.config.scheduler.interval_seconds));
 
         // 首次立即执行一次
@@ -49,9 +50,16 @@ impl Scheduler {
         }
 
         loop {
-            ticker.tick().await;
-            if let Err(e) = self.check_once().await {
-                error!("Scheduled check failed: {}", e);
+            tokio::select! {
+                _ = ticker.tick() => {
+                    if let Err(e) = self.check_once().await {
+                        error!("Scheduled check failed: {}", e);
+                    }
+                }
+                _ = cancel.cancelled() => {
+                    info!("Scheduler received shutdown signal, stopping");
+                    return Ok(());
+                }
             }
         }
     }
@@ -67,7 +75,7 @@ impl Scheduler {
 
         debug!("Checking entries after timestamp: {}", after);
 
-        let entries = self.jimaku.search_entries(Some(after), None).await?;
+        let entries = self.search_entries_with_retry(after).await?;
         info!("Found {} entries since last check", entries.len());
 
         // 合并配置文件订阅和数据库动态订阅
@@ -114,8 +122,37 @@ impl Scheduler {
         }
 
         self.db.set_last_check_time(now).await?;
+        self.write_heartbeat().await;
         info!("Jimaku check completed");
         Ok(())
+    }
+
+    /// Jimaku 搜索失败时有限重试（指数退避 1s/2s/4s）
+    async fn search_entries_with_retry(&self, after: i64) -> Result<Vec<Entry>> {
+        const MAX_ATTEMPTS: u32 = 3;
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            match self.jimaku.search_entries(Some(after), None).await {
+                Ok(entries) => return Ok(entries),
+                Err(e) if attempt < MAX_ATTEMPTS => {
+                    let backoff = Duration::from_secs(1 << (attempt - 1));
+                    warn!(
+                        "Jimaku search failed (attempt {}/{}): {}, retrying in {:?}",
+                        attempt, MAX_ATTEMPTS, e, backoff
+                    );
+                    tokio::time::sleep(backoff).await;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    /// 每轮成功 check 后刷新心跳文件，供 Docker healthcheck 使用
+    async fn write_heartbeat(&self) {
+        if let Err(e) = tokio::fs::write("/tmp/jimaku_heartbeat", b"ok").await {
+            warn!("Failed to write heartbeat file: {}", e);
+        }
     }
 
     async fn process_entry(&self, entry: &Entry, keyword_filter: Option<&[String]>) -> Result<()> {
@@ -141,16 +178,14 @@ impl Scheduler {
             }
 
             let mut downloaded = false;
-            let mut _file_path = None;
 
             if let Some(downloader) = &self.downloader {
                 match downloader
                     .download_subtitle(&entry.name, &file.name, &file.url)
                     .await
                 {
-                    Ok(path) => {
+                    Ok(_) => {
                         downloaded = true;
-                        _file_path = Some(path);
                     }
                     Err(e) => {
                         warn!("Failed to download {}: {}", file.name, e);
@@ -158,21 +193,10 @@ impl Scheduler {
                 }
             }
 
-            self.notifier
-                .notify_new_subtitle(
-                    &entry.name,
-                    entry.english_name.as_deref(),
-                    entry.japanese_name.as_deref(),
-                    &file.name,
-                    file.size,
-                    &file.url,
-                    entry.id,
-                    downloaded,
-                )
-                .await?;
-
-            self.db
-                .record_file(
+            // 先占位（notified=0），发送成功才确认，失败留下轮重试
+            let file_id = self
+                .db
+                .upsert_pending_file(
                     entry.id,
                     &entry.name,
                     &file.name,
@@ -181,11 +205,55 @@ impl Scheduler {
                     downloaded,
                 )
                 .await?;
+
+            match self
+                .notifier
+                .notify_new_subtitle(&NewSubtitle {
+                    entry_name: &entry.name,
+                    english_name: entry.english_name.as_deref(),
+                    japanese_name: entry.japanese_name.as_deref(),
+                    file_name: &file.name,
+                    file_size: file.size,
+                    file_url: &file.url,
+                    entry_id: entry.id,
+                    downloaded,
+                })
+                .await
+            {
+                Ok(_) => {
+                    self.db.mark_notified(file_id).await?;
+                }
+                Err(e) => {
+                    let attempts = self
+                        .db
+                        .mark_notify_failed(file_id, MAX_NOTIFY_ATTEMPTS)
+                        .await?;
+                    error!(
+                        "Failed to send notification for {} (attempt {}/{}): {}",
+                        file.name, attempts, MAX_NOTIFY_ATTEMPTS, e
+                    );
+                    if attempts >= MAX_NOTIFY_ATTEMPTS {
+                        let _ = self
+                            .notifier
+                            .send_message(format!(
+                                "⚠️ 字幕通知重试 {} 次仍失败，已放弃: <code>{}</code>",
+                                attempts, file.name
+                            ))
+                            .await;
+                    }
+                }
+            }
+
+            // 通知间隔，避免触发 Telegram 限流
+            tokio::time::sleep(NOTIFY_INTERVAL).await;
         }
 
         Ok(())
     }
 }
+
+const MAX_NOTIFY_ATTEMPTS: i64 = 5;
+const NOTIFY_INTERVAL: Duration = Duration::from_millis(350);
 
 fn file_matches_keywords(file_name: &str, keywords: &[String]) -> bool {
     if keywords.is_empty() {

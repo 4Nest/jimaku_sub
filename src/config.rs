@@ -14,6 +14,10 @@ pub struct Config {
     pub download: DownloadConfig,
     #[serde(default = "default_scheduler")]
     pub scheduler: SchedulerConfig,
+    #[serde(default = "default_database")]
+    pub database: DatabaseConfig,
+    #[serde(default = "default_logging")]
+    pub logging: LoggingConfig,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -51,6 +55,20 @@ pub struct SchedulerConfig {
     pub interval_seconds: u64,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct DatabaseConfig {
+    #[serde(default = "default_database_url")]
+    pub url: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct LoggingConfig {
+    #[serde(default = "default_log_dir")]
+    pub dir: String,
+    #[serde(default = "default_log_retention_days")]
+    pub retention_days: u32,
+}
+
 fn default_jimaku() -> JimakuConfig {
     JimakuConfig {
         api_key: String::new(),
@@ -82,6 +100,31 @@ fn default_scheduler() -> SchedulerConfig {
     }
 }
 
+fn default_database() -> DatabaseConfig {
+    DatabaseConfig {
+        url: default_database_url(),
+    }
+}
+
+fn default_logging() -> LoggingConfig {
+    LoggingConfig {
+        dir: default_log_dir(),
+        retention_days: default_log_retention_days(),
+    }
+}
+
+fn default_database_url() -> String {
+    "sqlite://data/jimaku_subscriber.db".to_string()
+}
+
+fn default_log_dir() -> String {
+    "./logs".to_string()
+}
+
+fn default_log_retention_days() -> u32 {
+    30
+}
+
 fn default_base_url() -> String {
     "https://jimaku.cc".to_string()
 }
@@ -110,6 +153,9 @@ impl Config {
         builder = builder.set_default("download.enabled", false)?;
         builder = builder.set_default("download.download_path", "/app/downloads")?;
         builder = builder.set_default("scheduler.interval_seconds", 300)?;
+        builder = builder.set_default("database.url", "sqlite://data/jimaku_subscriber.db")?;
+        builder = builder.set_default("logging.dir", "./logs")?;
+        builder = builder.set_default("logging.retention_days", 30)?;
 
         // 从配置文件读取
         if Path::new("config.toml").exists() {
@@ -143,6 +189,15 @@ impl Config {
         }
         if let Ok(v) = std::env::var("SCHEDULER_INTERVAL_SECONDS") {
             cfg.scheduler.interval_seconds = v.parse().unwrap_or(300);
+        }
+        if let Ok(v) = std::env::var("DATABASE_URL") {
+            cfg.database.url = v;
+        }
+        if let Ok(v) = std::env::var("LOG_DIR") {
+            cfg.logging.dir = v;
+        }
+        if let Ok(v) = std::env::var("LOG_RETENTION_DAYS") {
+            cfg.logging.retention_days = v.parse().unwrap_or(30);
         }
         // 解析逗号分隔的 anilist_ids
         if let Ok(v) = std::env::var("SUBSCRIPTION_ANILIST_IDS") {

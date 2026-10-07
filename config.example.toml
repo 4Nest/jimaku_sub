@@ -19,3 +19,10 @@ download_path = "/app/downloads"
 
 [scheduler]
 interval_seconds = 300
+
+[database]
+url = "sqlite://data/jimaku_subscriber.db"
+
+[logging]
+dir = "./logs"
+retention_days = 30
