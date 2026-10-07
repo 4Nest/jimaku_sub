@@ -1,0 +1,24 @@
+services:
+  jimaku-subscriber:
+    build: .
+    container_name: jimaku-subscriber
+    restart: unless-stopped
+    environment:
+      - RUST_LOG=info
+      - LOG_DIR=/app/logs
+      # 必需配置
+      - JIMAKU_API_KEY=${JIMAKU_API_KEY}
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
+      # 可选配置
+      - DOWNLOAD_ENABLED=${DOWNLOAD_ENABLED:-false}
+      - DOWNLOAD_PATH=${DOWNLOAD_PATH:-/app/downloads}
+      #- SCHEDULER_INTERVAL_SECONDS=300
+      #- SUBSCRIPTION_ANILIST_IDS=16498,1535
+      #- SUBSCRIPTION_NAME_KEYWORDS=Attack on Titan,Shingeki
+    volumes:
+      - ./data:/app/data
+      - ./downloads:/app/downloads
+      - ./logs:/app/logs
+    # 也可以挂载配置文件
+    # - ./config.toml:/app/config.toml:ro

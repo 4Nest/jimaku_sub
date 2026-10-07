@@ -1,0 +1,21 @@
+# Jimaku 字幕订阅服务配置示例
+
+[jimaku]
+api_key = "your_jimaku_api_key_here"
+base_url = "https://jimaku.cc"
+
+[telegram]
+bot_token = "your_telegram_bot_token_here"
+chat_id = "your_chat_id_here"
+
+[subscription]
+# 空列表 = 订阅所有新字幕
+anilist_ids = []
+name_keywords = []
+
+[download]
+enabled = false
+download_path = "/app/downloads"
+
+[scheduler]
+interval_seconds = 300

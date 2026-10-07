@@ -1,0 +1,138 @@
+# Jimaku 字幕订阅通知服务
+
+定时轮询 [jimaku.cc](https://jimaku.cc) 的新字幕，通过 Telegram Bot 推送通知，支持可选的自动下载。
+
+## 功能特性
+
+- 🔔 **新字幕通知** — 定时检查 jimaku.cc 新上传的字幕，通过 Telegram 推送
+- ⬇️ **自动下载** — 可选自动下载字幕文件到指定目录
+- 🎯 **精准订阅** — 支持按 Jimaku Entry ID、作品名和文件关键词过滤字幕
+- 🤖 **Bot 交互** — 支持 Telegram 命令动态管理订阅
+- 🔒 **命令白名单** — 只允许配置的 `TELEGRAM_CHAT_ID` 执行 Bot 命令
+- 🗄️ **状态持久化** — SQLite 存储已通知记录，重启不重复推送
+- 🐳 **Docker 部署** — 一键容器化运行
+
+## Telegram Bot 命令
+
+| 命令 | 说明 |
+|------|------|
+| `/help` | 显示帮助信息 |
+| `/status` | 查看服务状态、已通知数量、上次检查时间 |
+| `/checknow` | 立即触发一次检查 |
+| `/download <entry_id>` | 下载指定 Jimaku Entry 的全部字幕，跳过已下载文件 |
+| `/sub <entry_id>` | 按 Jimaku Entry ID 添加订阅 |
+| `/sub <作品名>` | 搜索 Jimaku 并添加作品订阅 |
+| `/sub <作品名> -r NF\|Netflix\|ATX` | 只通知文件名匹配这些关键词的字幕 |
+| `/unsub <作品名\|entry_id>` | 取消订阅 |
+| `/listsubs` | 列出当前动态订阅 |
+
+## 快速开始
+
+### 1. 获取 API Key
+
+- **Jimaku API Key**: 登录 [jimaku.cc/account](https://jimaku.cc/account) 生成，只填 key 本身，不要加 `Bearer `
+- **Telegram Bot Token**: 在 [@BotFather](https://t.me/botfather) 创建 Bot 获取
+- **Telegram Chat ID**: 通过 [@userinfobot](https://t.me/userinfobot) 获取你的用户 ID
+
+### 2. Docker Compose 部署
+
+```bash
+# 复制环境变量模板
+cp .env.example .env
+# 编辑 .env 填入你的配置
+nano .env
+
+# 启动服务
+docker compose up -d
+```
+
+### 3. 环境变量配置
+
+| 变量 | 必需 | 说明 |
+|------|------|------|
+| `JIMAKU_API_KEY` | ✅ | Jimaku API Key |
+| `TELEGRAM_BOT_TOKEN` | ✅ | Telegram Bot Token |
+| `TELEGRAM_CHAT_ID` | ✅ | 目标 Chat ID |
+| `DOWNLOAD_ENABLED` | ❌ | 是否自动下载 (`true`/`false`) |
+| `DOWNLOAD_PATH` | ❌ | 下载路径 (默认 `/app/downloads`) |
+| `SCHEDULER_INTERVAL_SECONDS` | ❌ | 检查间隔秒数 (默认 `300`) |
+| `SUBSCRIPTION_ANILIST_IDS` | ❌ | 订阅的 AniList ID，逗号分隔 |
+| `SUBSCRIPTION_NAME_KEYWORDS` | ❌ | 订阅关键词，逗号分隔 |
+
+### 4. 配置文件方式
+
+也可以使用 `config.toml`（适合更复杂的配置）：
+
+```toml
+[jimaku]
+api_key = "your_api_key"
+
+[telegram]
+bot_token = "your_bot_token"
+chat_id = "your_chat_id"
+
+[subscription]
+anilist_ids = [16498, 1535]
+name_keywords = ["Attack on Titan"]
+
+[download]
+enabled = true
+download_path = "/app/downloads"
+
+[scheduler]
+interval_seconds = 300
+```
+
+挂载到容器：
+```yaml
+volumes:
+  - ./config.toml:/app/config.toml:ro
+```
+
+## 订阅逻辑
+
+- 如果 `anilist_ids` 和 `name_keywords` 都为空 → **订阅所有新字幕**
+- 如果配置了过滤条件 → **只通知匹配的条目**
+- 配置文件订阅 + 动态订阅（通过 `/sub` 命令）会合并生效
+- 动态订阅的作品名和关键词会缓存到 SQLite，`/status` 和 `/listsubs` 不会重复请求外部接口
+- 日志同时输出到 `docker logs` 和 `./logs/jimaku-subscriber.log.*`
+
+## 目录结构
+
+```
+.
+├── data/              # SQLite 数据库持久化
+├── downloads/         # 字幕下载目录（如启用）
+├── logs/              # 应用日志
+├── src/
+│   ├── main.rs        # 入口
+│   ├── config.rs      # 配置管理
+│   ├── jimaku.rs      # Jimaku API 客户端
+│   ├── telegram.rs    # Telegram 通知
+│   ├── database.rs    # SQLite 存储
+│   ├── scheduler.rs   # 定时轮询
+│   └── downloader.rs  # 字幕下载
+├── Dockerfile
+├── docker-compose.yml
+├── config.example.toml
+└── .env.example
+```
+
+## 技术栈
+
+- **Rust** + **Tokio** 异步运行时
+- **reqwest** HTTP 客户端
+- **teloxide** Telegram Bot 框架
+- **sqlx** SQLite 异步 ORM
+- **tracing** 结构化日志
+
+## 自行编译
+
+```bash
+cargo build --release
+# 二进制在 target/release/jimaku-subscriber
+```
+
+## License
+
+MIT

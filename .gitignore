@@ -1,0 +1,6 @@
+/target
+/data
+/logs
+/downloads
+.env
+.DS_Store
