@@ -1,5 +1,7 @@
 services:
   jimaku-subscriber:
+    # CI 发布到 GHCR 的镜像；本地/服务器无镜像时回退到 build
+    image: ghcr.io/4nest/jimaku_sub:latest
     build: .
     container_name: jimaku-subscriber
     restart: unless-stopped
