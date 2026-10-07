@@ -1,4 +1,3 @@
-mod anilist;
 mod bot;
 mod config;
 mod database;

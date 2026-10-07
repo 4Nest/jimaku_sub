@@ -20,7 +20,7 @@
 
 设置 `CHANNEL_ENABLED=true` + `CHANNEL_CHAT_ID` 后，除订阅通知外，jimaku 全站新字幕会**直接以文件发到指定频道**（不走订阅匹配）：
 
-- 文件消息 Caption（MarkdownV2 装饰面板风）：✦ 日语主标题（点击跳 jimaku）+ 罗马音/英文副标题 + 等宽文件名 + 大小/时间/AniList 链接（罗马音来自 AniList，自动缓存）
+- 文件消息 Caption（MarkdownV2）：等宽文件名 + 大小/时间/jimaku/AniList 链接 + 日语番名 hashtag（可点击搜索）
 - 超过 48MB 的文件改发带下载链接的文字卡片
 - 只发功能开启后新出现的字幕，不回填历史；失败自动重试，重试耗尽发私聊告警
 

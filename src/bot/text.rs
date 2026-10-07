@@ -148,9 +148,6 @@ const LINE_LIMIT: usize = 200;
 /// 频道推送一条字幕所需的展示数据
 pub struct ChannelSubtitle<'a> {
     pub japanese_name: Option<&'a str>,
-    pub english_name: Option<&'a str>,
-    /// AniList 罗马音；查不到时调用方降级为 entry.name（本身即罗马音）
-    pub romaji: &'a str,
     pub file_name: &'a str,
     pub file_size: i64,
     /// jimaku 下载直链（仅超大文件链接卡片使用）
@@ -198,41 +195,21 @@ fn md_link(label: &str, url: &str) -> String {
     )
 }
 
-/// 主标题：优先日语名，其次罗马音，再英语名
-fn channel_primary<'a>(sub: &ChannelSubtitle<'a>) -> &'a str {
-    sub.japanese_name
-        .map(str::trim)
-        .filter(|n| !n.is_empty())
-        .or_else(|| {
-            let romaji = sub.romaji.trim();
-            if romaji.is_empty() {
-                None
-            } else {
-                Some(romaji)
-            }
-        })
-        .or_else(|| sub.english_name.map(str::trim).filter(|n| !n.is_empty()))
-        .unwrap_or("未知作品")
-}
-
-/// 频道消息正文（装饰面板风，MarkdownV2）：
-/// ✦ *日语名(链接)* ✦ + 分隔线 + 等宽文件名 + meta 行
+/// 频道消息正文（MarkdownV2）：等宽文件名 + meta 行 + 日语番名 hashtag
 fn channel_body(sub: &ChannelSubtitle<'_>) -> String {
-    let primary = channel_primary(sub);
-
     let mut text = format!(
-        "✦ *{}* ✦",
-        md_link(
-            truncate(primary, LINE_LIMIT),
-            &format!("https://jimaku.cc/entry/{}", sub.entry_id)
-        )
-    );
-
-    text.push_str(&format!(
-        "\n──────────────────\n🎞 {}\n📦 {} │ 🕐 {}",
+        "🎞 {}\n📦 {} │ 🕐 {}",
         md_code(truncate(sub.file_name, LINE_LIMIT)),
         md_escape(&format_size(sub.file_size)),
         md_escape(&sub.file_modified.format("%Y-%m-%d %H:%M UTC").to_string())
+    );
+
+    text.push_str(&format!(
+        " │ 🔗 {}",
+        md_link(
+            "jimaku",
+            &format!("https://jimaku.cc/entry/{}", sub.entry_id)
+        )
     ));
 
     if let Some(id) = sub.anilist_id {
@@ -337,11 +314,9 @@ mod tests {
         channel_caption, channel_link_card, detect_language, format_size, ChannelSubtitle,
     };
 
-    fn sub<'a>(ja: Option<&'a str>, en: Option<&'a str>, romaji: &'a str) -> ChannelSubtitle<'a> {
+    fn sub(ja: Option<&str>) -> ChannelSubtitle<'_> {
         ChannelSubtitle {
             japanese_name: ja,
-            english_name: en,
-            romaji,
             file_name: "S01E13.WEBRip.TVer.ja[cc].srt",
             file_size: 45_000,
             entry_id: 11783,
@@ -371,24 +346,16 @@ mod tests {
     }
 
     #[test]
-    fn caption_panel_layout_markdown() {
-        let s = sub(
-            Some("本好きの下剋上 領主の養女"),
-            Some("Ascendance of a Bookworm"),
-            "Honzuki no Gekokujou",
-        );
+    fn caption_layout_markdown() {
+        let s = sub(Some("本好きの下剋上 領主の養女"));
         let c = channel_caption(&s);
-        // 主标题：✦ 装饰 + 日语名粗体 + jimaku 链接
-        assert!(c.contains("✦ *[本好きの下剋上 領主の養女](https://jimaku.cc/entry/11783)* ✦"));
-        // 不展示罗马音/英文副标题，标题行之后直接是分隔线
-        assert!(!c.contains("Honzuki no Gekokujou"));
-        assert!(!c.contains("Ascendance of a Bookworm"));
-        assert!(c.contains("✦\n──────────────────"));
-        // 分隔线 + 等宽文件名
-        assert!(c.contains("──────────────────\n🎞 `S01E13.WEBRip.TVer.ja[cc].srt`"));
-        // meta 行：竖线分隔 + AniList 链接，日期连字符已转义
+        // 等宽文件名开头，无标题行和分隔线
+        assert!(c.starts_with("🎞 `S01E13.WEBRip.TVer.ja[cc].srt`"));
+        assert!(!c.contains("✦"));
+        assert!(!c.contains("──────"));
+        // meta 行：竖线分隔 + jimaku / AniList 链接，日期连字符已转义
         assert!(c.contains(
-            "📦 44 KB │ 🕐 2026\\-10\\-07 15:20 UTC │ 🎬 [AniList](https://anilist.co/anime/999999)"
+            "📦 44 KB │ 🕐 2026\\-10\\-07 15:20 UTC │ 🔗 [jimaku](https://jimaku.cc/entry/11783) │ 🎬 [AniList](https://anilist.co/anime/999999)"
         ));
         // 日语番名 hashtag：空一行 + 空格剔除、不带标点
         assert!(c.contains("\n\n\\#本好きの下剋上領主の養女"));
@@ -397,7 +364,7 @@ mod tests {
 
     #[test]
     fn caption_hashtag_strips_punctuation() {
-        let s = sub(Some("生徒会にも穴はある！"), None, "Ro");
+        let s = sub(Some("生徒会にも穴はある！"));
         let c = channel_caption(&s);
         assert!(
             c.contains("\n\n\\#生徒会にも穴はある"),
@@ -409,55 +376,26 @@ mod tests {
 
     #[test]
     fn caption_omits_hashtag_without_japanese_name() {
-        let s = sub(None, Some("En"), "Ro");
+        let s = sub(None);
         let c = channel_caption(&s);
         assert!(!c.contains("\\#"));
     }
 
     #[test]
-    fn caption_shows_only_primary_name() {
-        // 无日语名时主标题降级为罗马音，英文名不再单独展示
-        let s = sub(None, Some("Yomi no Tsugai"), "yomi no tsugai");
-        let c = channel_caption(&s);
-        assert!(c.contains("[yomi no tsugai](https://jimaku.cc/entry/11783)"));
-        // 英文名不展示，罗马音只在主标题出现一次
-        let occurrences = c.matches("Yomi no Tsugai").count() + c.matches("yomi no tsugai").count();
-        assert_eq!(occurrences, 1);
-    }
-
-    #[test]
-    fn caption_all_names_same_keeps_title_only() {
-        let s = sub(Some("Same Name"), Some("Same Name"), "same name");
-        let c = channel_caption(&s);
-        assert!(c.contains("[Same Name](https://jimaku.cc/entry/11783)"));
-        // 副标题区为空：标题行之后直接是分隔线
-        assert!(c.contains("✦\n──────────────────"));
-    }
-
-    #[test]
-    fn caption_handles_missing_names() {
-        let s = sub(None, None, "Only Romaji");
-        let c = channel_caption(&s);
-        assert!(c.contains("[Only Romaji](https://jimaku.cc/entry/11783)"));
-    }
-
-    #[test]
     fn caption_omits_anilist_link_without_id() {
-        let mut s = sub(None, None, "Only Romaji");
+        let mut s = sub(None);
         s.anilist_id = None;
         let c = channel_caption(&s);
         assert!(!c.contains("AniList"));
+        // jimaku 链接仍保留
+        assert!(c.contains("[jimaku](https://jimaku.cc/entry/11783)"));
     }
 
     #[test]
     fn caption_stays_within_telegram_limit() {
         let long = "あ".repeat(500);
-        let long2 = "貴".repeat(500);
-        let long3 = "族".repeat(500);
         let s = ChannelSubtitle {
             japanese_name: Some(&long),
-            english_name: Some(&long2),
-            romaji: &long3,
             file_name: &long,
             file_size: 1,
             entry_id: 1,
@@ -465,32 +403,24 @@ mod tests {
             anilist_id: Some(1),
             file_modified: chrono::Utc::now(),
         };
-        // 三行不同名 + 长文件名全部拉满，仍须在字符上限内
+        // 长文件名 + 长标签全部拉满，仍须在字符上限内
         assert!(channel_caption(&s).chars().count() <= 1024);
-    }
-
-    #[test]
-    fn caption_escapes_markdown_special_chars() {
-        // 括号、点、方括号等 MarkdownV2 特殊字符必须转义
-        let s = sub(None, Some("Show (2026). Ver2"), "Show (2026). Ver2");
-        let c = channel_caption(&s);
-        assert!(c.contains("Show \\(2026\\)\\. Ver2"), "未正确转义: {}", c);
     }
 
     #[test]
     fn code_span_keeps_punctuation_unescaped() {
         // 等宽代码内只需转义反引号和反斜杠，. 和 [] 原样保留
-        let s = sub(None, None, "Ro");
+        let s = sub(None);
         let c = channel_caption(&s);
         assert!(c.contains("`S01E13.WEBRip.TVer.ja[cc].srt`"));
     }
 
     #[test]
     fn link_card_contains_oversize_hint() {
-        let s = sub(Some("日"), Some("En"), "Ro");
+        let s = sub(Some("日"));
         let c = channel_link_card(&s);
         assert!(c.contains("jimaku.cc/entry/11783"));
         assert!(c.contains("超过发送上限"));
-        assert!(c.contains("──────────────────"));
+        assert!(c.contains("\\#日"));
     }
 }

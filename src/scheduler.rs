@@ -1,5 +1,4 @@
 use crate::{
-    anilist::AnilistClient,
     bot::text::{channel_caption, channel_link_card, ChannelSubtitle},
     config::Config,
     database::Database,
@@ -20,7 +19,6 @@ pub struct Scheduler {
     db: Arc<Database>,
     notifier: TelegramNotifier,
     channel: Option<ChannelNotifier>,
-    anilist: AnilistClient,
     downloader: Downloader,
 }
 
@@ -50,7 +48,6 @@ impl Scheduler {
             db,
             notifier,
             channel,
-            anilist: AnilistClient::new(),
             downloader,
         }
     }
@@ -386,8 +383,6 @@ impl Scheduler {
             return;
         }
 
-        // 确认有新文件要发才解析罗马音（惰性，不浪费 AniList 配额）
-        let romaji = self.resolve_romaji(entry).await;
         let channel = self.channel.as_ref().expect("channel notifier missing");
 
         for file in new_files {
@@ -411,8 +406,6 @@ impl Scheduler {
 
             let sub = ChannelSubtitle {
                 japanese_name: entry.japanese_name.as_deref(),
-                english_name: entry.english_name.as_deref(),
-                romaji: &romaji,
                 file_name: &file.name,
                 file_size: file.size,
                 entry_id: entry.id,
@@ -499,19 +492,10 @@ impl Scheduler {
                 }
             };
 
-            let (ja, en, romaji) = match entry {
-                Some(e) => (
-                    e.japanese_name.clone(),
-                    e.english_name.clone(),
-                    self.resolve_romaji(e).await,
-                ),
-                None => (None, None, file.entry_name.clone()),
-            };
+            let ja = entry.and_then(|e| e.japanese_name.clone());
 
             let sub = ChannelSubtitle {
                 japanese_name: ja.as_deref(),
-                english_name: en.as_deref(),
-                romaji: &romaji,
                 file_name: &file.file_name,
                 file_size: file.file_size.unwrap_or(0),
                 entry_id: file.entry_id,
@@ -566,27 +550,6 @@ impl Scheduler {
             tokio::time::sleep(CHANNEL_SEND_INTERVAL).await;
         }
         Ok(())
-    }
-
-    /// 解析作品罗马音：缓存 → AniList API → 降级 entry.name（本身即罗马音）
-    async fn resolve_romaji(&self, entry: &Entry) -> String {
-        if let Some(anilist_id) = entry.anilist_id {
-            match self.db.get_cached_romaji(anilist_id).await {
-                Ok(Some(Some(cached))) => return cached,
-                Ok(Some(None)) => debug!("AniList negative cache hit for {}", anilist_id),
-                Ok(None) => {
-                    let romaji = self.anilist.get_romaji(anilist_id).await;
-                    if let Err(e) = self.db.cache_romaji(anilist_id, romaji.as_deref()).await {
-                        warn!("Failed to cache romaji for {}: {}", anilist_id, e);
-                    }
-                    if let Some(romaji) = romaji {
-                        return romaji;
-                    }
-                }
-                Err(e) => warn!("Failed to read romaji cache: {}", e),
-            }
-        }
-        entry.name.clone()
     }
 
     /// 通知后把字幕文件作为文档发送到聊天（订阅开启 send_file 时）

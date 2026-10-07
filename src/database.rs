@@ -690,31 +690,6 @@ impl Database {
             )
             .collect())
     }
-
-    // ---------- AniList 标题缓存 ----------
-
-    /// 读取缓存的罗马音标题。Ok(None)=未缓存；Ok(Some(None))=负缓存（查无条目）
-    pub async fn get_cached_romaji(&self, anilist_id: i32) -> Result<Option<Option<String>>> {
-        let row: Option<(Option<String>,)> =
-            sqlx::query_as("SELECT romaji FROM anilist_titles WHERE anilist_id = ?")
-                .bind(anilist_id)
-                .fetch_optional(&self.pool)
-                .await?;
-        Ok(row.map(|(romaji,)| romaji))
-    }
-
-    pub async fn cache_romaji(&self, anilist_id: i32, romaji: Option<&str>) -> Result<()> {
-        sqlx::query(
-            "INSERT INTO anilist_titles (anilist_id, romaji, fetched_at) VALUES (?, ?, ?)
-             ON CONFLICT(anilist_id) DO UPDATE SET romaji = excluded.romaji, fetched_at = excluded.fetched_at",
-        )
-        .bind(anilist_id)
-        .bind(romaji)
-        .bind(Utc::now().to_rfc3339())
-        .execute(&self.pool)
-        .await?;
-        Ok(())
-    }
 }
 
 /// 待推送的频道文件记录
@@ -855,18 +830,6 @@ mod tests {
             .unwrap();
         assert!(db.is_channel_pushed("http://x/dead").await.unwrap());
         assert!(db.list_channel_pending().await.unwrap().is_empty());
-
-        // anilist 正/负缓存
-        assert!(db.get_cached_romaji(1).await.unwrap().is_none());
-        db.cache_romaji(1, Some("Honzuki no Gekokujou"))
-            .await
-            .unwrap();
-        assert_eq!(
-            db.get_cached_romaji(1).await.unwrap(),
-            Some(Some("Honzuki no Gekokujou".to_string()))
-        );
-        db.cache_romaji(2, None).await.unwrap();
-        assert_eq!(db.get_cached_romaji(2).await.unwrap(), Some(None));
 
         std::fs::remove_dir_all(&dir).ok();
     }
