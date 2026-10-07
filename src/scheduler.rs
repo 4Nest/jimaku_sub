@@ -416,10 +416,10 @@ impl Scheduler {
                 file_name: &file.name,
                 file_size: file.size,
                 entry_id: entry.id,
+                anilist_id: entry.anilist_id,
                 file_modified: file.last_modified,
             };
-            let keyboard =
-                crate::bot::keyboards::channel_keyboard(&file.url, entry.id, entry.anilist_id);
+            let keyboard = crate::bot::keyboards::channel_keyboard(&file.url);
 
             let result = if file.size > MAX_DOCUMENT_SIZE {
                 channel
@@ -518,14 +518,11 @@ impl Scheduler {
                 file_name: &file.file_name,
                 file_size: file.file_size.unwrap_or(0),
                 entry_id: file.entry_id,
+                anilist_id: entry.and_then(|e| e.anilist_id),
                 // 占位行未存文件时间，重试用当前时间近似
                 file_modified: Utc::now(),
             };
-            let keyboard = crate::bot::keyboards::channel_keyboard(
-                &file.file_url,
-                file.entry_id,
-                entry.and_then(|e| e.anilist_id),
-            );
+            let keyboard = crate::bot::keyboards::channel_keyboard(&file.file_url);
 
             let result = if file.file_size.unwrap_or(0) > MAX_DOCUMENT_SIZE {
                 channel

@@ -61,34 +61,15 @@ pub fn download_keyboard(file_id: i64) -> InlineKeyboardMarkup {
     )]])
 }
 
-/// 频道消息的 URL 跳转按钮：下载直链 + jimaku 作品页 + AniList（有 id 时）
+/// 频道消息的 URL 跳转按钮：字幕下载直链
 /// URL 按钮无需回调权限，频道成员都可点击
-pub fn channel_keyboard(
-    file_url: &str,
-    entry_id: i64,
-    anilist_id: Option<i32>,
-) -> InlineKeyboardMarkup {
-    let mut link_row = vec![InlineKeyboardButton::url(
-        "📺 jimaku",
-        reqwest::Url::parse(&format!("https://jimaku.cc/entry/{}", entry_id))
-            .expect("entry url is valid"),
-    )];
-    if let Some(id) = anilist_id {
-        link_row.push(InlineKeyboardButton::url(
-            "🎬 AniList",
-            reqwest::Url::parse(&format!("https://anilist.co/anime/{}", id))
-                .expect("anilist url is valid"),
-        ));
-    }
-    InlineKeyboardMarkup::new(vec![
-        vec![InlineKeyboardButton::url(
-            "⬇️ 下载字幕",
-            reqwest::Url::parse(file_url).unwrap_or_else(|_| {
-                reqwest::Url::parse("https://jimaku.cc").expect("fallback url is valid")
-            }),
-        )],
-        link_row,
-    ])
+pub fn channel_keyboard(file_url: &str) -> InlineKeyboardMarkup {
+    InlineKeyboardMarkup::new(vec![vec![InlineKeyboardButton::url(
+        "⬇️ 下载字幕",
+        reqwest::Url::parse(file_url).unwrap_or_else(|_| {
+            reqwest::Url::parse("https://jimaku.cc").expect("fallback url is valid")
+        }),
+    )]])
 }
 
 /// /sub 搜索结果的候选列表按钮

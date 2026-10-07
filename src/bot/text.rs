@@ -154,6 +154,8 @@ pub struct ChannelSubtitle<'a> {
     pub file_name: &'a str,
     pub file_size: i64,
     pub entry_id: i64,
+    /// 有 id 时在 meta 行附加 AniList 文字链接
+    pub anilist_id: Option<i32>,
     pub file_modified: chrono::DateTime<chrono::Utc>,
 }
 
@@ -165,14 +167,14 @@ fn truncate(s: &str, max: usize) -> &str {
     }
 }
 
-/// 收集 日/英/罗马音 三行名字，去掉空白并做大小写不敏感去重
+/// 引用块名字行：罗马音 / 英文 顺序，去空白并做大小写不敏感去重
 fn name_lines(sub: &ChannelSubtitle<'_>) -> Vec<(&'static str, String)> {
     let mut lines: Vec<(&'static str, String)> = Vec::new();
     let mut seen: Vec<String> = Vec::new();
     for (emoji, name) in [
-        ("🇯🇵", sub.japanese_name),
-        ("🇬🇧", sub.english_name),
         ("🔤", Some(sub.romaji)),
+        ("🇬🇧", sub.english_name),
+        ("🇯🇵", sub.japanese_name),
     ] {
         let Some(name) = name.map(str::trim).filter(|n| !n.is_empty()) else {
             continue;
@@ -187,9 +189,9 @@ fn name_lines(sub: &ChannelSubtitle<'_>) -> Vec<(&'static str, String)> {
     lines
 }
 
-/// 主标题：优先英语名，其次罗马音，再日语名
+/// 主标题：优先日语名，其次罗马音，再英语名
 fn channel_primary<'a>(sub: &ChannelSubtitle<'a>) -> &'a str {
-    sub.english_name
+    sub.japanese_name
         .map(str::trim)
         .filter(|n| !n.is_empty())
         .or_else(|| {
@@ -200,7 +202,7 @@ fn channel_primary<'a>(sub: &ChannelSubtitle<'a>) -> &'a str {
                 Some(romaji)
             }
         })
-        .or_else(|| sub.japanese_name.map(str::trim).filter(|n| !n.is_empty()))
+        .or_else(|| sub.english_name.map(str::trim).filter(|n| !n.is_empty()))
         .unwrap_or("未知作品")
 }
 
@@ -228,6 +230,22 @@ fn channel_header(sub: &ChannelSubtitle<'_>) -> (String, String) {
     (title, quote)
 }
 
+/// meta 行：大小 · 时间 · AniList 文字链接（有 id 时）
+fn channel_meta(sub: &ChannelSubtitle<'_>) -> String {
+    let mut meta = format!(
+        "📦 {} · 🕐 {}",
+        format_size(sub.file_size),
+        sub.file_modified.format("%Y-%m-%d %H:%M UTC")
+    );
+    if let Some(id) = sub.anilist_id {
+        meta.push_str(&format!(
+            " · 🎬 <a href=\"https://anilist.co/anime/{}\">AniList</a>",
+            id
+        ));
+    }
+    meta
+}
+
 /// 频道文件消息的 Caption（HTML，≤1024 字符）
 pub fn channel_caption(sub: &ChannelSubtitle<'_>) -> String {
     let (title, quote) = channel_header(sub);
@@ -236,10 +254,9 @@ pub fn channel_caption(sub: &ChannelSubtitle<'_>) -> String {
         text.push_str(&format!("\n{}\n", quote));
     }
     text.push_str(&format!(
-        "\n📝 <code>{}</code>\n📦 {} · 🕐 {}",
+        "\n📝 <code>{}</code>\n{}",
         html_escape(truncate(sub.file_name, LINE_LIMIT)),
-        format_size(sub.file_size),
-        sub.file_modified.format("%Y-%m-%d %H:%M UTC")
+        channel_meta(sub)
     ));
     // Telegram 上限按字符计（Rust len() 是字节数，CJK 会虚高 3 倍）
     debug_assert!(
@@ -258,10 +275,9 @@ pub fn channel_link_card(sub: &ChannelSubtitle<'_>) -> String {
         text.push_str(&format!("\n{}\n", quote));
     }
     text.push_str(&format!(
-        "\n📝 <code>{}</code>\n📦 {} · 🕐 {}\n⚠️ 文件超过发送上限，请用下方按钮下载",
+        "\n📝 <code>{}</code>\n{}\n⚠️ 文件超过发送上限，请用下方按钮下载",
         html_escape(sub.file_name),
-        format_size(sub.file_size),
-        sub.file_modified.format("%Y-%m-%d %H:%M UTC")
+        channel_meta(sub)
     ));
     text
 }
@@ -328,6 +344,7 @@ mod tests {
             file_name: "S01E13.WEBRip.TVer.ja[cc].srt",
             file_size: 45_000,
             entry_id: 11783,
+            anilist_id: Some(999999),
             file_modified: chrono::DateTime::parse_from_rfc3339("2026-10-07T15:20:00+00:00")
                 .unwrap()
                 .with_timezone(&chrono::Utc),
@@ -359,28 +376,31 @@ mod tests {
             "Honzuki no Gekokujou",
         );
         let c = channel_caption(&s);
-        // 主标题：粗体 + 跳转作品页
+        // 主标题：日语名粗体 + 跳转 jimaku 作品页
         assert!(c.contains(
-            "📺 <b><a href=\"https://jimaku.cc/entry/11783\">Ascendance of a Bookworm</a></b>"
+            "📺 <b><a href=\"https://jimaku.cc/entry/11783\">本好きの下剋上 領主の養女</a></b>"
         ));
-        // 其余名字收进引用块
+        // 引用块：罗马音 / 英文
         assert!(c.contains(
-            "<blockquote>🇯🇵 本好きの下剋上 領主の養女\n🔤 Honzuki no Gekokujou</blockquote>"
+            "<blockquote>🔤 Honzuki no Gekokujou\n🇬🇧 Ascendance of a Bookworm</blockquote>"
         ));
-        // 元信息行
-        assert!(c.contains("📦 44 KB · 🕐 2026-10-07 15:20 UTC"));
-        // Caption 里不再放文字下载链接（走 URL 按钮）
+        // 元信息行：大小 · 时间 · AniList 文字链接
+        assert!(c.contains(
+            "📦 44 KB · 🕐 2026-10-07 15:20 UTC · 🎬 <a href=\"https://anilist.co/anime/999999\">AniList</a>"
+        ));
+        // Caption 里不放文字下载链接（走 URL 按钮）
         assert!(!c.contains("下载字幕"));
     }
 
     #[test]
     fn caption_dedups_same_names_case_insensitive() {
-        // 英语名与罗马音相同（大小写不同）→ 罗马音被去重，引用块消失
+        // 英语名与罗马音相同（大小写不同）→ 英文名行被去重
         let s = sub(None, Some("Yomi no Tsugai"), "yomi no tsugai");
         let c = channel_caption(&s);
-        assert!(!c.contains("🔤"), "romaji 行应被去重: {}", c);
+        assert!(!c.contains("🇬🇧"), "英文行应被去重: {}", c);
+        assert!(c.contains(">yomi no tsugai</a></b>"));
+        // 罗马音=主标题（无日语名时），引用块为空
         assert!(!c.contains("<blockquote>"));
-        assert!(c.contains(">Yomi no Tsugai</a></b>"));
     }
 
     #[test]
@@ -400,6 +420,14 @@ mod tests {
     }
 
     #[test]
+    fn caption_omits_anilist_link_without_id() {
+        let mut s = sub(None, None, "Only Romaji");
+        s.anilist_id = None;
+        let c = channel_caption(&s);
+        assert!(!c.contains("AniList"));
+    }
+
+    #[test]
     fn caption_stays_within_telegram_limit() {
         let long = "あ".repeat(500);
         let long2 = "貴".repeat(500);
@@ -411,6 +439,7 @@ mod tests {
             file_name: &long,
             file_size: 1,
             entry_id: 1,
+            anilist_id: Some(1),
             file_modified: chrono::Utc::now(),
         };
         // 三行不同名 + 长文件名全部拉满，仍须在字符上限内
