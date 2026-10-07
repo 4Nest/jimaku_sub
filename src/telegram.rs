@@ -62,6 +62,15 @@ impl TelegramNotifier {
         Ok(())
     }
 
+    /// 把本地文件作为 Telegram 文档发送
+    pub async fn send_document(&self, path: &std::path::Path) -> Result<()> {
+        self.bot
+            .send_document(self.chat_id, teloxide::types::InputFile::file(path))
+            .await?;
+        info!("Telegram document sent: {:?}", path);
+        Ok(())
+    }
+
     pub fn chat_id(&self) -> ChatId {
         self.chat_id
     }

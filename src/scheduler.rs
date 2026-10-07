@@ -16,7 +16,17 @@ pub struct Scheduler {
     jimaku: JimakuClient,
     db: Arc<Database>,
     notifier: TelegramNotifier,
-    downloader: Option<Downloader>,
+    downloader: Downloader,
+}
+
+/// 一个 entry 命中订阅后聚合出的处理策略
+struct EntryPolicy {
+    keyword_filter: Option<Vec<String>>,
+    /// 命中订阅全部被静音时为 false：静默记录，不推送
+    notify: bool,
+    auto_download: bool,
+    /// 通知后把字幕文件直接发到聊天
+    send_file: bool,
 }
 
 impl Scheduler {
@@ -26,11 +36,7 @@ impl Scheduler {
         db: Arc<Database>,
         notifier: TelegramNotifier,
     ) -> Self {
-        let downloader = if config.download.enabled {
-            Some(Downloader::new(&config.download.download_path))
-        } else {
-            None
-        };
+        let downloader = Downloader::new(&config.download.download_path);
 
         Self {
             config,
@@ -116,7 +122,33 @@ impl Scheduler {
                 Some(keywords)
             };
 
-            if let Err(e) = self.process_entry(&entry, keyword_filter.as_deref()).await {
+            // 全局/配置订阅命中：沿用全局策略；动态订阅命中：聚合订阅级策略
+            let policy = if is_global || config_match {
+                EntryPolicy {
+                    keyword_filter,
+                    notify: true,
+                    auto_download: self.config.download.enabled,
+                    send_file: false,
+                }
+            } else {
+                let explicit_download: Vec<bool> = matching_dynamic_subs
+                    .iter()
+                    .filter_map(|sub| sub.auto_download)
+                    .collect();
+                let auto_download = if explicit_download.is_empty() {
+                    self.config.download.enabled
+                } else {
+                    explicit_download.iter().any(|enabled| *enabled)
+                };
+                EntryPolicy {
+                    keyword_filter,
+                    notify: matching_dynamic_subs.iter().any(|sub| !sub.muted),
+                    auto_download,
+                    send_file: matching_dynamic_subs.iter().any(|sub| sub.send_file),
+                }
+            };
+
+            if let Err(e) = self.process_entry(&entry, &policy).await {
                 error!("Failed to process entry {}: {}", entry.id, e);
             }
         }
@@ -155,14 +187,14 @@ impl Scheduler {
         }
     }
 
-    async fn process_entry(&self, entry: &Entry, keyword_filter: Option<&[String]>) -> Result<()> {
+    async fn process_entry(&self, entry: &Entry, policy: &EntryPolicy) -> Result<()> {
         let files = self.jimaku.get_entry_files(entry.id).await?;
         if files.is_empty() {
             return Ok(());
         }
 
         for file in files {
-            if let Some(keywords) = keyword_filter {
+            if let Some(keywords) = policy.keyword_filter.as_deref() {
                 if !file_matches_keywords(&file.name, keywords) {
                     debug!(
                         "File {} does not match subtitle keywords, skipping",
@@ -178,14 +210,17 @@ impl Scheduler {
             }
 
             let mut downloaded = false;
+            let mut file_path = None;
 
-            if let Some(downloader) = &self.downloader {
-                match downloader
+            if policy.auto_download {
+                match self
+                    .downloader
                     .download_subtitle(&entry.name, &file.name, &file.url)
                     .await
                 {
-                    Ok(_) => {
+                    Ok(path) => {
                         downloaded = true;
+                        file_path = Some(path);
                     }
                     Err(e) => {
                         warn!("Failed to download {}: {}", file.name, e);
@@ -206,6 +241,13 @@ impl Scheduler {
                 )
                 .await?;
 
+            // 订阅被静音：静默记录，不推送（避免解除静音后补推刷屏）
+            if !policy.notify {
+                debug!("Subscription muted, silently recording {}", file.name);
+                self.db.mark_notified(file_id).await?;
+                continue;
+            }
+
             match self
                 .notifier
                 .notify_new_subtitle(&NewSubtitle {
@@ -224,6 +266,10 @@ impl Scheduler {
             {
                 Ok(_) => {
                     self.db.mark_notified(file_id).await?;
+
+                    if policy.send_file {
+                        self.send_subtitle_file(entry, &file, file_path).await;
+                    }
                 }
                 Err(e) => {
                     let attempts = self
@@ -251,6 +297,57 @@ impl Scheduler {
         }
 
         Ok(())
+    }
+
+    /// 通知后把字幕文件作为文档发送到聊天（订阅开启 send_file 时）
+    async fn send_subtitle_file(
+        &self,
+        entry: &Entry,
+        file: &crate::jimaku::FileEntry,
+        downloaded_path: Option<std::path::PathBuf>,
+    ) {
+        let path = match downloaded_path {
+            Some(path) => Some(path),
+            None => match self
+                .downloader
+                .download_subtitle(&entry.name, &file.name, &file.url)
+                .await
+            {
+                Ok(path) => {
+                    let _ = self
+                        .db
+                        .record_file(
+                            entry.id,
+                            &entry.name,
+                            &file.name,
+                            &file.url,
+                            Some(file.size),
+                            true,
+                        )
+                        .await;
+                    Some(path)
+                }
+                Err(e) => {
+                    warn!("Failed to download {} for sending: {}", file.name, e);
+                    None
+                }
+            },
+        };
+
+        let Some(path) = path else {
+            let _ = self
+                .notifier
+                .send_message(format!(
+                    "⚠️ 字幕文件下载失败，无法发送: <code>{}</code>",
+                    file.name
+                ))
+                .await;
+            return;
+        };
+
+        if let Err(e) = self.notifier.send_document(&path).await {
+            error!("Failed to send subtitle file {}: {}", file.name, e);
+        }
     }
 }
 

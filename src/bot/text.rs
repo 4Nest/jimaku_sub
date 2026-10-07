@@ -158,9 +158,18 @@ pub fn format_subscriptions(subs: &[Subscription]) -> String {
             )
         };
 
+        let mut flags = String::new();
+        if sub.muted {
+            flags.push_str(" 🔇");
+        }
+        if sub.send_file {
+            flags.push_str(" 📄");
+        }
+
         lines.push(format!(
-            "  • {} (<code>{}</code>{}) 订阅于 {}",
+            "  • {}{} (<code>{}</code>{}) 订阅于 {}",
             html_escape(title),
+            flags,
             sub.entry_id,
             keyword_text,
             sub.created_at.format("%Y-%m-%d %H:%M")
