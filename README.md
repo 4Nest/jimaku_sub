@@ -128,7 +128,7 @@ volumes:
 
 ## 订阅逻辑
 
-- 如果 `anilist_ids` 和 `name_keywords` 都为空 → **订阅所有新字幕**
+- 如果 `anilist_ids` 和 `name_keywords` 都为空 → **不匹配任何条目**（全量推送请用 `CHANNEL_ENABLED` 频道功能）
 - 如果配置了过滤条件 → **只通知匹配的条目**
 - 配置文件订阅 + 动态订阅（通过 `/sub` 命令）会合并生效
 - 动态订阅的作品名和关键词会缓存到 SQLite，`/status` 和 `/listsubs` 不会重复请求外部接口

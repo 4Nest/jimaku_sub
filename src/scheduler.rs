@@ -111,11 +111,10 @@ impl Scheduler {
         };
 
         // 合并配置文件订阅和数据库动态订阅
+        // 注意：无任何订阅 = 不推送（全量推送请用频道功能 CHANNEL_ENABLED）
         let dynamic_subs = self.db.list_subscriptions().await?;
         let config_anilist_ids = &self.config.subscription.anilist_ids;
         let config_keywords = &self.config.subscription.name_keywords;
-        let is_global =
-            config_anilist_ids.is_empty() && config_keywords.is_empty() && dynamic_subs.is_empty();
 
         for entry in entries {
             let config_match = if config_anilist_ids.is_empty() && config_keywords.is_empty() {
@@ -128,7 +127,7 @@ impl Scheduler {
                 .filter(|sub| entry.id == sub.entry_id)
                 .collect::<Vec<_>>();
 
-            let sub_matched = is_global || config_match || !matching_dynamic_subs.is_empty();
+            let sub_matched = config_match || !matching_dynamic_subs.is_empty();
             if !sub_matched && self.channel.is_none() {
                 debug!("Entry {} does not match subscription, skipping", entry.id);
                 continue;
@@ -156,8 +155,7 @@ impl Scheduler {
                 continue;
             }
 
-            let keyword_filter = if is_global
-                || config_match
+            let keyword_filter = if config_match
                 || matching_dynamic_subs
                     .iter()
                     .any(|sub| sub.keywords.is_empty())
@@ -171,8 +169,8 @@ impl Scheduler {
                 Some(keywords)
             };
 
-            // 全局/配置订阅命中：沿用全局策略；动态订阅命中：聚合订阅级策略
-            let policy = if is_global || config_match {
+            // 配置订阅命中：沿用全局策略；动态订阅命中：聚合订阅级策略
+            let policy = if config_match {
                 EntryPolicy {
                     keyword_filter,
                     notify: true,
