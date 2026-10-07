@@ -29,7 +29,7 @@
 1. 创建频道，把 bot 加为**管理员**（发布消息权限）
 2. 获取频道数字 id：Telegram Web 打开频道，地址栏 `/#-100xxxxxxxxxx`；或转发频道消息给 @userinfobot
 3. `.env` 加 `CHANNEL_ENABLED=true` 和 `CHANNEL_CHAT_ID=-100xxxxxxxxxx`，重启容器
-4. 启动时频道会收到确认消息；收不到说明 bot 权限不足（服务会启动失败并提示）
+4. 启动时会静默验证频道权限，bot 未加管理员则服务启动失败并提示
 
 ## Telegram Bot 命令
 

@@ -105,6 +105,12 @@ impl ChannelNotifier {
         })
     }
 
+    /// 启动时静默验证频道可访问（bot 已加管理员），不发任何消息
+    pub async fn verify_access(&self) -> Result<()> {
+        self.bot.get_chat(self.chat_id).await?;
+        Ok(())
+    }
+
     /// 发送字幕文件到频道，Caption 为 MarkdownV2（≤1024 字符）
     pub async fn send_subtitle_document(
         &self,

@@ -48,14 +48,14 @@ async fn main() -> Result<()> {
     let notifier = TelegramNotifier::new(&config.telegram.bot_token, &config.telegram.chat_id)
         .context("Failed to create Telegram notifier")?;
 
-    // 频道全量推送：enabled 时装配并向频道发确认消息验证权限（bot 未加管理员则启动失败）
+    // 频道全量推送：enabled 时装配并静默验证频道权限（bot 未加管理员则启动失败，不发消息）
     let channel = if config.channel.enabled {
         let channel = ChannelNotifier::new(notifier.bot(), &config.channel.chat_id)
             .context("Failed to create channel notifier")?;
         channel
-            .send_text_card("📡 *全量字幕推送已开启*\n本频道将接收 jimaku 全站新字幕文件")
+            .verify_access()
             .await
-            .context("Failed to send channel startup message (bot 是否已加为频道管理员?)")?;
+            .context("Failed to access channel (bot 是否已加为频道管理员?)")?;
         info!("Channel full-feed push enabled: {}", config.channel.chat_id);
         Some(channel)
     } else {
