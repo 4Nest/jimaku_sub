@@ -27,6 +27,20 @@ pub struct Subscription {
     pub title: Option<String>,
     pub keywords: Vec<String>,
     pub created_at: DateTime<Utc>,
+    /// 是否静音（跳过通知但仍记录）
+    pub muted: bool,
+    /// 订阅级自动下载：None=跟随全局配置
+    pub auto_download: Option<bool>,
+    /// 通知后是否直接把字幕文件发到聊天
+    pub send_file: bool,
+}
+
+/// /sub 多结果选择的暂存记录
+#[derive(Debug, Clone)]
+pub struct PendingSearch {
+    pub chat_id: i64,
+    pub keywords: Vec<String>,
+    pub entry_ids: Vec<i64>,
 }
 
 impl Database {
@@ -94,12 +108,34 @@ impl Database {
         self.ensure_column("subscriptions", "title", "TEXT").await?;
         self.ensure_column("subscriptions", "keywords", "TEXT NOT NULL DEFAULT '[]'")
             .await?;
+        self.ensure_column("subscriptions", "muted", "INTEGER NOT NULL DEFAULT 0")
+            .await?;
+        // NULL=跟随全局下载配置, 0=关, 1=开
+        self.ensure_column("subscriptions", "auto_download", "INTEGER")
+            .await?;
+        self.ensure_column("subscriptions", "send_file", "INTEGER NOT NULL DEFAULT 0")
+            .await?;
         // notified: 1=已通知, 0=待通知(占位), -1=死信(重试耗尽)
         // 历史行默认 1，避免升级后重复推送
         self.ensure_column("notified_files", "notified", "INTEGER NOT NULL DEFAULT 1")
             .await?;
         self.ensure_column("notified_files", "attempts", "INTEGER NOT NULL DEFAULT 0")
             .await?;
+
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS pending_searches (
+                token TEXT PRIMARY KEY,
+                chat_id INTEGER NOT NULL,
+                keywords TEXT NOT NULL DEFAULT '[]',
+                entry_ids TEXT NOT NULL DEFAULT '[]',
+                created_at TEXT NOT NULL
+            );
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .context("Failed to create pending_searches table")?;
 
         info!("Database migration completed");
         Ok(())
@@ -312,8 +348,17 @@ impl Database {
     }
 
     pub async fn list_subscriptions(&self) -> Result<Vec<Subscription>> {
-        let rows: Vec<(i64, Option<String>, Option<String>, String)> = sqlx::query_as(
-            "SELECT entry_id, title, keywords, created_at
+        type Row = (
+            i64,
+            Option<String>,
+            Option<String>,
+            String,
+            i64,
+            Option<i64>,
+            i64,
+        );
+        let rows: Vec<Row> = sqlx::query_as(
+            "SELECT entry_id, title, keywords, created_at, muted, auto_download, send_file
                  FROM subscriptions ORDER BY created_at",
         )
         .fetch_all(&self.pool)
@@ -321,18 +366,107 @@ impl Database {
 
         let subs = rows
             .into_iter()
-            .filter_map(|(entry_id, title, keywords, ts)| {
-                DateTime::parse_from_rfc3339(&ts)
-                    .ok()
-                    .map(|dt| Subscription {
-                        entry_id,
-                        title,
-                        keywords: parse_keywords(keywords.as_deref()),
-                        created_at: dt.with_timezone(&Utc),
-                    })
-            })
+            .filter_map(
+                |(entry_id, title, keywords, ts, muted, auto_download, send_file)| {
+                    DateTime::parse_from_rfc3339(&ts)
+                        .ok()
+                        .map(|dt| Subscription {
+                            entry_id,
+                            title,
+                            keywords: parse_keywords(keywords.as_deref()),
+                            created_at: dt.with_timezone(&Utc),
+                            muted: muted != 0,
+                            auto_download: auto_download.map(|v| v != 0),
+                            send_file: send_file != 0,
+                        })
+                },
+            )
             .collect();
         Ok(subs)
+    }
+
+    pub async fn get_subscription(&self, entry_id: i64) -> Result<Option<Subscription>> {
+        Ok(self
+            .list_subscriptions()
+            .await?
+            .into_iter()
+            .find(|sub| sub.entry_id == entry_id))
+    }
+
+    /// 更新订阅级策略（读-改-写整体落库）
+    pub async fn save_subscription_policy(
+        &self,
+        entry_id: i64,
+        muted: bool,
+        auto_download: Option<bool>,
+        send_file: bool,
+    ) -> Result<bool> {
+        let result = sqlx::query(
+            "UPDATE subscriptions SET muted = ?, auto_download = ?, send_file = ?
+             WHERE entry_id = ?",
+        )
+        .bind(if muted { 1 } else { 0 })
+        .bind(auto_download.map(|v| if v { 1 } else { 0 }))
+        .bind(if send_file { 1 } else { 0 })
+        .bind(entry_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    pub async fn create_pending_search(
+        &self,
+        token: &str,
+        chat_id: i64,
+        keywords: &[String],
+        entry_ids: &[i64],
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO pending_searches (token, chat_id, keywords, entry_ids, created_at)
+             VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(token)
+        .bind(chat_id)
+        .bind(serde_json::to_string(keywords)?)
+        .bind(serde_json::to_string(entry_ids)?)
+        .bind(Utc::now().to_rfc3339())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// 读取暂存的搜索记录；惰性清理 24 小时前的过期记录
+    pub async fn get_pending_search(&self, token: &str) -> Result<Option<PendingSearch>> {
+        let cutoff = (Utc::now() - chrono::Duration::hours(24)).to_rfc3339();
+        sqlx::query("DELETE FROM pending_searches WHERE created_at < ?")
+            .bind(&cutoff)
+            .execute(&self.pool)
+            .await?;
+
+        let row: Option<(i64, String, String)> = sqlx::query_as(
+            "SELECT chat_id, keywords, entry_ids FROM pending_searches WHERE token = ?",
+        )
+        .bind(token)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(row.and_then(|(chat_id, keywords, entry_ids)| {
+            let keywords = serde_json::from_str(&keywords).ok()?;
+            let entry_ids = serde_json::from_str(&entry_ids).ok()?;
+            Some(PendingSearch {
+                chat_id,
+                keywords,
+                entry_ids,
+            })
+        }))
+    }
+
+    pub async fn delete_pending_search(&self, token: &str) -> Result<()> {
+        sqlx::query("DELETE FROM pending_searches WHERE token = ?")
+            .bind(token)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
     }
 
     pub async fn get_notified_file_by_id(&self, id: i64) -> Result<Option<NotifiedFile>> {

@@ -52,6 +52,46 @@ pub fn new_subtitle_card(sub: &NewSubtitle<'_>) -> String {
     )
 }
 
+/// 单个订阅的管理卡片（/listsubs 与按钮操作后刷新用）
+pub fn subscription_card(sub: &Subscription) -> String {
+    let title = sub.title.as_deref().unwrap_or("未命名订阅");
+
+    let keyword_text = if sub.keywords.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\n🎯 规则: <code>{}</code>",
+            html_escape(&sub.keywords.join("|"))
+        )
+    };
+
+    let notify_state = if sub.muted {
+        "🔇 静音"
+    } else {
+        "🔔 开启"
+    };
+    let download_state = match sub.auto_download {
+        None => "跟随全局",
+        Some(true) => "开",
+        Some(false) => "关",
+    };
+    let send_file_state = if sub.send_file { "开" } else { "关" };
+
+    format!(
+        "📋 <b>{}</b>\n\
+        Entry ID: <code>{}</code>{}\n\
+        通知: {} · 自动下载: {} · 发文件: {}\n\
+        订阅于 {}",
+        html_escape(title),
+        sub.entry_id,
+        keyword_text,
+        notify_state,
+        download_state,
+        send_file_state,
+        sub.created_at.format("%Y-%m-%d %H:%M")
+    )
+}
+
 /// 从字幕文件名推断语言（启发式，识别不出则不展示）
 pub fn detect_language(file_name: &str) -> Option<&'static str> {
     let lower = file_name.to_lowercase();

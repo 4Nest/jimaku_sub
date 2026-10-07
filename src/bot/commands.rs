@@ -5,9 +5,15 @@ use teloxide::types::ParseMode;
 use teloxide::utils::command::BotCommands;
 use tracing::{error, warn};
 
-use crate::bot::text::{display_entry_title, format_subscriptions, html_escape};
+use crate::bot::keyboards::{entry_selection_keyboard, subscription_panel};
+use crate::bot::text::{display_entry_title, format_subscriptions, html_escape, subscription_card};
 use crate::bot::AppState;
 use crate::downloader::Downloader;
+
+/// /sub 多结果选择的短 token（callback_data 有 64 字节上限）
+pub fn new_search_token() -> String {
+    uuid::Uuid::new_v4().simple().to_string()[..8].to_string()
+}
 
 #[derive(BotCommands, Clone)]
 #[command(rename_rule = "lowercase", description = "Jimaku 字幕订阅 Bot 命令:\n")]
@@ -83,16 +89,27 @@ pub async fn answer(bot: Bot, msg: Message, cmd: Command, state: AppState) -> Re
         Command::Sub(args) => handle_subscribe(&bot, chat_id, &state, &args).await?,
         Command::Unsub(args) => handle_unsubscribe(&bot, chat_id, &state, &args).await?,
         Command::Listsubs => match state.db.list_subscriptions().await {
+            Ok(subs) if subs.is_empty() => {
+                bot.send_message(chat_id, "📭 当前没有动态订阅").await?;
+            }
             Ok(subs) => {
-                let text = if subs.is_empty() {
-                    "📭 当前没有动态订阅".to_string()
-                } else {
-                    format!("📋 <b>动态订阅列表</b>\n\n{}", format_subscriptions(&subs))
-                };
-
-                bot.send_message(chat_id, text)
-                    .parse_mode(ParseMode::Html)
+                const MAX_PANELS: usize = 20;
+                for sub in subs.iter().take(MAX_PANELS) {
+                    bot.send_message(chat_id, subscription_card(sub))
+                        .parse_mode(ParseMode::Html)
+                        .reply_markup(subscription_panel(sub))
+                        .await?;
+                }
+                if subs.len() > MAX_PANELS {
+                    bot.send_message(
+                        chat_id,
+                        format!(
+                            "…其余 {} 个订阅请用 /unsub <entry_id> 管理",
+                            subs.len() - MAX_PANELS
+                        ),
+                    )
                     .await?;
+                }
             }
             Err(e) => {
                 error!("Failed to list subscriptions: {}", e);
@@ -307,6 +324,37 @@ async fn handle_subscribe(
                 )
                 .parse_mode(ParseMode::Html)
                 .await?;
+                return Ok(());
+            }
+            Ok(entries) if entries.len() > 1 => {
+                // 多结果：暂存候选项，用按钮让用户选择
+                const MAX_CANDIDATES: usize = 8;
+                let token = new_search_token();
+                let candidates: Vec<_> = entries.into_iter().take(MAX_CANDIDATES).collect();
+                let entry_ids: Vec<i64> = candidates.iter().map(|e| e.id).collect();
+
+                match state
+                    .db
+                    .create_pending_search(&token, chat_id.0, &parsed.release_keywords, &entry_ids)
+                    .await
+                {
+                    Ok(_) => {
+                        bot.send_message(
+                            chat_id,
+                            format!(
+                                "🔍 找到 <b>{}</b> 个匹配作品，请选择要订阅的:",
+                                candidates.len()
+                            ),
+                        )
+                        .parse_mode(ParseMode::Html)
+                        .reply_markup(entry_selection_keyboard(&token, &candidates))
+                        .await?;
+                    }
+                    Err(e) => {
+                        bot.send_message(chat_id, format!("❌ 暂存搜索结果失败: {}", e))
+                            .await?;
+                    }
+                }
                 return Ok(());
             }
             Ok(mut entries) => entries.remove(0),
