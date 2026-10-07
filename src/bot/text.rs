@@ -234,7 +234,7 @@ fn channel_primary<'a>(sub: &ChannelSubtitle<'a>) -> &'a str {
 }
 
 /// 频道消息正文（装饰面板风，MarkdownV2）：
-/// ✦ *日语名(链接)* ✦ + 副标题名字行 + 分隔线 + 等宽文件名 + meta 行
+/// ✦ *日语名(链接)* ✦ + 引用块副标题（罗马音/英文）+ 分隔线 + 等宽文件名 + meta 行
 fn channel_body(sub: &ChannelSubtitle<'_>) -> String {
     let primary = channel_primary(sub);
     let primary_key = primary.to_lowercase();
@@ -251,7 +251,8 @@ fn channel_body(sub: &ChannelSubtitle<'_>) -> String {
         .into_iter()
         .filter(|name| name.to_lowercase() != primary_key)
     {
-        text.push_str(&format!("\n{}", md_escape(truncate(&name, LINE_LIMIT))));
+        // MarkdownV2 引用块：行首 > 前缀
+        text.push_str(&format!("\n>{}", md_escape(truncate(&name, LINE_LIMIT))));
     }
 
     text.push_str(&format!(
@@ -389,8 +390,8 @@ mod tests {
         let c = channel_caption(&s);
         // 主标题：✦ 装饰 + 日语名粗体 + jimaku 链接
         assert!(c.contains("✦ *[本好きの下剋上 領主の養女](https://jimaku.cc/entry/11783)* ✦"));
-        // 副标题：罗马音 / 英文 各一行（无 emoji 前缀）
-        assert!(c.contains("\nHonzuki no Gekokujou\nAscendance of a Bookworm\n"));
+        // 副标题：引用块内 罗马音 / 英文 各一行
+        assert!(c.contains("\n>Honzuki no Gekokujou\n>Ascendance of a Bookworm\n"));
         // 分隔线 + 等宽文件名
         assert!(c.contains("──────────────────\n🎞 `S01E13.WEBRip.TVer.ja[cc].srt`"));
         // meta 行：竖线分隔 + AniList 链接，日期连字符已转义
