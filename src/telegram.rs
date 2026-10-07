@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use chrono::{DateTime, Utc};
 use teloxide::adaptors::throttle::Limits;
 use teloxide::adaptors::Throttle;
 use teloxide::prelude::*;
@@ -8,22 +9,25 @@ use tracing::info;
 /// 通知用 Bot：带限流，自动遵循 Telegram API 速率限制并在 429 时等待重试
 pub type ThrottledBot = Throttle<Bot>;
 
-#[derive(Clone)]
-pub struct TelegramNotifier {
-    bot: ThrottledBot,
-    chat_id: ChatId,
-}
-
 /// 一条新字幕通知所需的全部信息
 pub struct NewSubtitle<'a> {
+    /// notified_files 表行 id，用于下载按钮 callback
+    pub file_id: i64,
     pub entry_name: &'a str,
     pub english_name: Option<&'a str>,
     pub japanese_name: Option<&'a str>,
     pub file_name: &'a str,
     pub file_size: i64,
     pub file_url: &'a str,
+    pub file_modified: DateTime<Utc>,
     pub entry_id: i64,
     pub downloaded: bool,
+}
+
+#[derive(Clone)]
+pub struct TelegramNotifier {
+    bot: ThrottledBot,
+    chat_id: ChatId,
 }
 
 impl TelegramNotifier {
@@ -38,46 +42,13 @@ impl TelegramNotifier {
     }
 
     pub async fn notify_new_subtitle(&self, sub: &NewSubtitle<'_>) -> Result<()> {
-        let display_name = sub.english_name.unwrap_or(sub.entry_name);
-        let size_mb = sub.file_size as f64 / 1024.0 / 1024.0;
-        let size_str = if size_mb < 0.01 {
-            format!("{} B", sub.file_size)
-        } else {
-            format!("{:.2} MB", size_mb)
-        };
-
-        let download_status = if sub.downloaded {
-            "✅ 已自动下载"
-        } else {
-            "⬇️ 点击链接下载"
-        };
-
-        let japanese_line = sub
-            .japanese_name
-            .filter(|n| !n.is_empty() && *n != display_name)
-            .map(|n| format!("🇯🇵 <code>{}</code>\n", n))
-            .unwrap_or_default();
-
-        let text = format!(
-            "🎬 <b>新字幕发布</b>\n\n\
-            📺 <b>{}</b>\n\
-            {}\
-            📝 <code>{}</code>\n\
-            📦 大小: <code>{}</code>\n\
-            🔗 <a href=\"{}\">下载字幕</a> · <a href=\"https://jimaku.cc/entry/{}\">作品页面</a>\n\n\
-            {}",
-            display_name,
-            japanese_line,
-            sub.file_name,
-            size_str,
-            sub.file_url,
-            sub.entry_id,
-            download_status
-        );
+        let text = crate::bot::text::new_subtitle_card(sub);
+        let keyboard = crate::bot::keyboards::download_keyboard(sub.file_id);
 
         self.bot
-            .send_message(self.chat_id, &text)
+            .send_message(self.chat_id, text)
             .parse_mode(ParseMode::Html)
+            .reply_markup(keyboard)
             .await?;
         info!("Telegram notification sent for {}", sub.file_name);
         Ok(())

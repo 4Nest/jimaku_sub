@@ -26,6 +26,13 @@ impl Downloader {
         }
     }
 
+    /// 计算某个字幕文件的本地路径（不保证文件存在）
+    pub fn local_path(&self, entry_name: &str, file_name: &str) -> PathBuf {
+        self.download_path
+            .join(sanitize_filename(entry_name))
+            .join(sanitize_filename(file_name))
+    }
+
     pub async fn download_subtitle(
         &self,
         entry_name: &str,

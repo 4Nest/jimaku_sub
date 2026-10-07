@@ -209,12 +209,14 @@ impl Scheduler {
             match self
                 .notifier
                 .notify_new_subtitle(&NewSubtitle {
+                    file_id,
                     entry_name: &entry.name,
                     english_name: entry.english_name.as_deref(),
                     japanese_name: entry.japanese_name.as_deref(),
                     file_name: &file.name,
                     file_size: file.size,
                     file_url: &file.url,
+                    file_modified: file.last_modified,
                     entry_id: entry.id,
                     downloaded,
                 })

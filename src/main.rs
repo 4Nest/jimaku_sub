@@ -14,6 +14,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
+use crate::bot::callbacks::handle_callback;
 use crate::bot::commands::{answer, Command};
 use crate::bot::AppState;
 use crate::config::{Config, LoggingConfig};
@@ -82,9 +83,13 @@ async fn main() -> Result<()> {
 
     // dispatcher 使用独立的无限流 Bot，避免通知队列阻塞轮询
     let dispatcher_bot = Bot::new(&state.config.telegram.bot_token);
-    let handler = Update::filter_message()
-        .filter_command::<Command>()
-        .endpoint(answer);
+    let handler = dptree::entry()
+        .branch(
+            Update::filter_message()
+                .filter_command::<Command>()
+                .endpoint(answer),
+        )
+        .branch(Update::filter_callback_query().endpoint(handle_callback));
 
     info!("Starting Telegram bot dispatcher...");
 

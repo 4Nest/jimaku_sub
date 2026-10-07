@@ -335,6 +335,34 @@ impl Database {
         Ok(subs)
     }
 
+    pub async fn get_notified_file_by_id(&self, id: i64) -> Result<Option<NotifiedFile>> {
+        type Row = (i64, i64, String, String, String, Option<i64>, String, i64);
+        let row: Option<Row> = sqlx::query_as(
+            "SELECT id, entry_id, entry_name, file_name, file_url, file_size, notified_at, downloaded
+                 FROM notified_files WHERE id = ?",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(row.and_then(
+            |(id, entry_id, entry_name, file_name, file_url, file_size, ts, downloaded)| {
+                DateTime::parse_from_rfc3339(&ts)
+                    .ok()
+                    .map(|dt| NotifiedFile {
+                        id,
+                        entry_id,
+                        entry_name,
+                        file_name,
+                        file_url,
+                        file_size,
+                        notified_at: dt.with_timezone(&Utc),
+                        downloaded,
+                    })
+            },
+        ))
+    }
+
     pub async fn get_notified_files_count(&self) -> Result<i64> {
         let row: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM notified_files")
             .fetch_one(&self.pool)
