@@ -153,8 +153,8 @@ pub struct ChannelSubtitle<'a> {
     pub romaji: &'a str,
     pub file_name: &'a str,
     pub file_size: i64,
-    pub file_url: &'a str,
     pub entry_id: i64,
+    pub file_modified: chrono::DateTime<chrono::Utc>,
 }
 
 /// 按 chars() 截断，避免切坏 UTF-8
@@ -187,33 +187,59 @@ fn name_lines(sub: &ChannelSubtitle<'_>) -> Vec<(&'static str, String)> {
     lines
 }
 
-fn channel_names(sub: &ChannelSubtitle<'_>) -> Vec<(&'static str, String)> {
-    let lines = name_lines(sub);
-    if lines.is_empty() {
-        vec![("📺", "未知作品".to_string())]
+/// 主标题：优先英语名，其次罗马音，再日语名
+fn channel_primary<'a>(sub: &ChannelSubtitle<'a>) -> &'a str {
+    sub.english_name
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+        .or_else(|| {
+            let romaji = sub.romaji.trim();
+            if romaji.is_empty() {
+                None
+            } else {
+                Some(romaji)
+            }
+        })
+        .or_else(|| sub.japanese_name.map(str::trim).filter(|n| !n.is_empty()))
+        .unwrap_or("未知作品")
+}
+
+/// 标题 + 引用块（方案 A · 引用块杂志风）。
+/// 返回 (标题行, 引用块) ；引用块为主标题之外的名字行，为空则不渲染。
+fn channel_header(sub: &ChannelSubtitle<'_>) -> (String, String) {
+    let primary = channel_primary(sub);
+    let primary_key = primary.to_lowercase();
+    let title = format!(
+        "📺 <b><a href=\"https://jimaku.cc/entry/{}\">{}</a></b>",
+        sub.entry_id,
+        html_escape(truncate(primary, LINE_LIMIT))
+    );
+
+    let quote_lines: Vec<String> = name_lines(sub)
+        .into_iter()
+        .filter(|(_, name)| name.to_lowercase() != primary_key)
+        .map(|(emoji, name)| format!("{} {}", emoji, html_escape(truncate(&name, LINE_LIMIT))))
+        .collect();
+    let quote = if quote_lines.is_empty() {
+        String::new()
     } else {
-        lines
-    }
+        format!("<blockquote>{}</blockquote>", quote_lines.join("\n"))
+    };
+    (title, quote)
 }
 
 /// 频道文件消息的 Caption（HTML，≤1024 字符）
 pub fn channel_caption(sub: &ChannelSubtitle<'_>) -> String {
-    let mut text = String::new();
-    for (emoji, name) in channel_names(sub) {
-        if !text.is_empty() {
-            text.push('\n');
-        }
-        text.push_str(&format!(
-            "{} <b>{}</b>",
-            emoji,
-            html_escape(truncate(&name, LINE_LIMIT))
-        ));
+    let (title, quote) = channel_header(sub);
+    let mut text = title;
+    if !quote.is_empty() {
+        text.push_str(&format!("\n{}\n", quote));
     }
     text.push_str(&format!(
-        "\n📝 <code>{}</code>\n📦 {} · <a href=\"https://jimaku.cc/entry/{}\">jimaku</a>",
+        "\n📝 <code>{}</code>\n📦 {} · 🕐 {}",
         html_escape(truncate(sub.file_name, LINE_LIMIT)),
         format_size(sub.file_size),
-        sub.entry_id
+        sub.file_modified.format("%Y-%m-%d %H:%M UTC")
     ));
     // Telegram 上限按字符计（Rust len() 是字节数，CJK 会虚高 3 倍）
     debug_assert!(
@@ -224,21 +250,18 @@ pub fn channel_caption(sub: &ChannelSubtitle<'_>) -> String {
     text
 }
 
-/// 超过发送上限的文件：频道文字卡片（含 jimaku 下载直链）
+/// 超过发送上限的文件：频道文字卡片（下载走消息下方 URL 按钮）
 pub fn channel_link_card(sub: &ChannelSubtitle<'_>) -> String {
-    let mut text = String::from("📦 文件过大，无法直接发送\n");
-    for (i, (emoji, name)) in channel_names(sub).into_iter().enumerate() {
-        if i > 0 {
-            text.push('\n');
-        }
-        text.push_str(&format!("{} <b>{}</b>", emoji, html_escape(&name)));
+    let (title, quote) = channel_header(sub);
+    let mut text = title;
+    if !quote.is_empty() {
+        text.push_str(&format!("\n{}\n", quote));
     }
     text.push_str(&format!(
-        "\n📝 <code>{}</code>\n📦 {}\n🔗 <a href=\"{}\">从 jimaku 下载</a> · <a href=\"https://jimaku.cc/entry/{}\">作品页面</a>",
+        "\n📝 <code>{}</code>\n📦 {} · 🕐 {}\n⚠️ 文件超过发送上限，请用下方按钮下载",
         html_escape(sub.file_name),
         format_size(sub.file_size),
-        sub.file_url,
-        sub.entry_id
+        sub.file_modified.format("%Y-%m-%d %H:%M UTC")
     ));
     text
 }
@@ -304,8 +327,10 @@ mod tests {
             romaji,
             file_name: "S01E13.WEBRip.TVer.ja[cc].srt",
             file_size: 45_000,
-            file_url: "https://jimaku.cc/file/1",
             entry_id: 11783,
+            file_modified: chrono::DateTime::parse_from_rfc3339("2026-10-07T15:20:00+00:00")
+                .unwrap()
+                .with_timezone(&chrono::Utc),
         }
     }
 
@@ -327,41 +352,50 @@ mod tests {
     }
 
     #[test]
-    fn caption_shows_three_distinct_names() {
+    fn caption_magazine_layout_with_quote_block() {
         let s = sub(
             Some("本好きの下剋上 領主の養女"),
             Some("Ascendance of a Bookworm"),
             "Honzuki no Gekokujou",
         );
         let c = channel_caption(&s);
-        assert!(c.contains("🇯🇵 <b>本好きの下剋上 領主の養女</b>"));
-        assert!(c.contains("🇬🇧 <b>Ascendance of a Bookworm</b>"));
-        assert!(c.contains("🔤 <b>Honzuki no Gekokujou</b>"));
-        assert!(c.contains("jimaku.cc/entry/11783"));
+        // 主标题：粗体 + 跳转作品页
+        assert!(c.contains(
+            "📺 <b><a href=\"https://jimaku.cc/entry/11783\">Ascendance of a Bookworm</a></b>"
+        ));
+        // 其余名字收进引用块
+        assert!(c.contains(
+            "<blockquote>🇯🇵 本好きの下剋上 領主の養女\n🔤 Honzuki no Gekokujou</blockquote>"
+        ));
+        // 元信息行
+        assert!(c.contains("📦 44 KB · 🕐 2026-10-07 15:20 UTC"));
+        // Caption 里不再放文字下载链接（走 URL 按钮）
+        assert!(!c.contains("下载字幕"));
     }
 
     #[test]
     fn caption_dedups_same_names_case_insensitive() {
-        // 英语名与罗马音相同（大小写不同）→ 只显示英语行
+        // 英语名与罗马音相同（大小写不同）→ 罗马音被去重，引用块消失
         let s = sub(None, Some("Yomi no Tsugai"), "yomi no tsugai");
         let c = channel_caption(&s);
         assert!(!c.contains("🔤"), "romaji 行应被去重: {}", c);
-        assert!(c.contains("🇬🇧"));
+        assert!(!c.contains("<blockquote>"));
+        assert!(c.contains(">Yomi no Tsugai</a></b>"));
     }
 
     #[test]
-    fn caption_all_names_same_keeps_one_line() {
+    fn caption_all_names_same_keeps_title_only() {
         let s = sub(Some("Same Name"), Some("Same Name"), "same name");
         let c = channel_caption(&s);
-        assert!(c.contains("🇯🇵 <b>Same Name</b>"));
-        assert!(!c.contains("🇬🇧") && !c.contains("🔤"));
+        assert!(c.contains(">Same Name</a></b>"));
+        assert!(!c.contains("<blockquote>"));
     }
 
     #[test]
     fn caption_handles_missing_names() {
         let s = sub(None, None, "Only Romaji");
         let c = channel_caption(&s);
-        assert!(c.contains("🔤 <b>Only Romaji</b>"));
+        assert!(c.contains(">Only Romaji</a></b>"));
         assert!(!c.contains("🇯🇵") && !c.contains("🇬🇧"));
     }
 
@@ -376,8 +410,8 @@ mod tests {
             romaji: &long3,
             file_name: &long,
             file_size: 1,
-            file_url: "https://jimaku.cc/file/1",
             entry_id: 1,
+            file_modified: chrono::Utc::now(),
         };
         // 三行不同名 + 长文件名全部拉满，仍须在字符上限内
         assert!(channel_caption(&s).chars().count() <= 1024);
@@ -391,11 +425,11 @@ mod tests {
     }
 
     #[test]
-    fn link_card_contains_both_links() {
+    fn link_card_contains_oversize_hint() {
         let s = sub(Some("日"), Some("En"), "Ro");
         let c = channel_link_card(&s);
-        assert!(c.contains("https://jimaku.cc/file/1"));
         assert!(c.contains("jimaku.cc/entry/11783"));
-        assert!(c.contains("文件过大"));
+        assert!(c.contains("超过发送上限"));
+        assert!(c.contains("<blockquote>"));
     }
 }

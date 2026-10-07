@@ -415,12 +415,16 @@ impl Scheduler {
                 romaji: &romaji,
                 file_name: &file.name,
                 file_size: file.size,
-                file_url: &file.url,
                 entry_id: entry.id,
+                file_modified: file.last_modified,
             };
+            let keyboard =
+                crate::bot::keyboards::channel_keyboard(&file.url, entry.id, entry.anilist_id);
 
             let result = if file.size > MAX_DOCUMENT_SIZE {
-                channel.send_text_card(&channel_link_card(&sub)).await
+                channel
+                    .send_text_card_with_keyboard(&channel_link_card(&sub), keyboard)
+                    .await
             } else {
                 match self
                     .downloader
@@ -429,7 +433,7 @@ impl Scheduler {
                 {
                     Ok(path) => {
                         channel
-                            .send_subtitle_document(&path, &channel_caption(&sub))
+                            .send_subtitle_document(&path, &channel_caption(&sub), keyboard)
                             .await
                     }
                     Err(e) => Err(e),
@@ -513,12 +517,20 @@ impl Scheduler {
                 romaji: &romaji,
                 file_name: &file.file_name,
                 file_size: file.file_size.unwrap_or(0),
-                file_url: &file.file_url,
                 entry_id: file.entry_id,
+                // 占位行未存文件时间，重试用当前时间近似
+                file_modified: Utc::now(),
             };
+            let keyboard = crate::bot::keyboards::channel_keyboard(
+                &file.file_url,
+                file.entry_id,
+                entry.and_then(|e| e.anilist_id),
+            );
 
             let result = if file.file_size.unwrap_or(0) > MAX_DOCUMENT_SIZE {
-                channel.send_text_card(&channel_link_card(&sub)).await
+                channel
+                    .send_text_card_with_keyboard(&channel_link_card(&sub), keyboard)
+                    .await
             } else {
                 match self
                     .downloader
@@ -527,7 +539,7 @@ impl Scheduler {
                 {
                     Ok(path) => {
                         channel
-                            .send_subtitle_document(&path, &channel_caption(&sub))
+                            .send_subtitle_document(&path, &channel_caption(&sub), keyboard)
                             .await
                     }
                     Err(e) => Err(e),
