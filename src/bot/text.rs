@@ -40,7 +40,7 @@ pub fn new_subtitle_card(sub: &NewSubtitle<'_>) -> String {
         html_escape(sub.file_name),
         language_line,
         size_str,
-        sub.file_modified.format("%Y-%m-%d %H:%M UTC"),
+        format_time(sub.file_modified),
         sub.file_url,
         sub.entry_id,
         download_status
@@ -138,6 +138,12 @@ pub fn format_size(bytes: i64) -> String {
     format!("{:.2} MB", mb)
 }
 
+/// 时间统一按 UTC+8 显示
+pub fn format_time(dt: chrono::DateTime<chrono::Utc>) -> String {
+    let cst = chrono::FixedOffset::east_opt(8 * 3600).unwrap();
+    dt.with_timezone(&cst).format("%Y-%m-%d %H:%M").to_string()
+}
+
 // ---------- 频道全量推送 ----------
 
 /// sendDocument caption 的硬上限（Telegram Bot API）
@@ -201,7 +207,7 @@ fn channel_body(sub: &ChannelSubtitle<'_>) -> String {
         "🎞 {}\n📦 {} │ 🕐 {}",
         md_code(truncate(sub.file_name, LINE_LIMIT)),
         md_escape(&format_size(sub.file_size)),
-        md_escape(&sub.file_modified.format("%Y-%m-%d %H:%M UTC").to_string())
+        md_escape(&format_time(sub.file_modified))
     );
 
     text.push_str(&format!(
@@ -355,7 +361,7 @@ mod tests {
         assert!(!c.contains("──────"));
         // meta 行：竖线分隔 + jimaku / AniList 链接，日期连字符已转义
         assert!(c.contains(
-            "📦 44 KB │ 🕐 2026\\-10\\-07 15:20 UTC │ 🔗 [jimaku](https://jimaku.cc/entry/11783) │ 🎬 [AniList](https://anilist.co/anime/999999)"
+            "📦 44 KB │ 🕐 2026\\-10\\-07 23:20 │ 🔗 [jimaku](https://jimaku.cc/entry/11783) │ 🎬 [AniList](https://anilist.co/anime/999999)"
         ));
         // 日语番名 hashtag：空一行 + 空格剔除、不带标点
         assert!(c.contains("\n\n\\#本好きの下剋上領主の養女"));
