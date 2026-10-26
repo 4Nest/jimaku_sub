@@ -437,6 +437,16 @@ impl Scheduler {
                     }
                     info!("Channel pushed: {}", file.name);
                 }
+                Err(e) if send_maybe_delivered(&e) => {
+                    // 请求已发出但响应超时：Telegram 很可能已收到，按已送达处理避免重试重复
+                    warn!(
+                        "Send of {} timed out after reaching Telegram, treating as delivered: {}",
+                        file.name, e
+                    );
+                    if let Err(e) = self.db.mark_channel_pushed(row_id).await {
+                        warn!("Failed to mark channel pushed {}: {}", file.name, e);
+                    }
+                }
                 Err(e) => {
                     match self
                         .db
@@ -525,6 +535,13 @@ impl Scheduler {
                 Ok(_) => {
                     self.db.mark_channel_pushed(file.id).await?;
                     info!("Channel retry succeeded: {}", file.file_name);
+                }
+                Err(e) if send_maybe_delivered(&e) => {
+                    warn!(
+                        "Retry send of {} timed out after reaching Telegram, treating as delivered: {}",
+                        file.file_name, e
+                    );
+                    self.db.mark_channel_pushed(file.id).await?;
                 }
                 Err(e) => {
                     let attempts = self
@@ -639,6 +656,17 @@ fn channel_file_action(
     ChannelAction::Send
 }
 
+/// 发送「疑似已送达」判定：请求已发出（非连接阶段失败）但等响应超时。
+/// Telegram API 无幂等键，此时重试会在频道产生重复消息，应改按已送达处理。
+fn send_maybe_delivered(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<teloxide::RequestError>(),
+            Some(teloxide::RequestError::Network(e)) if e.is_timeout() && !e.is_connect()
+        )
+    })
+}
+
 fn file_matches_keywords(file_name: &str, keywords: &[String]) -> bool {
     if keywords.is_empty() {
         return true;
@@ -681,6 +709,13 @@ mod tests {
             channel_file_action(false, after, baseline),
             ChannelAction::Send
         );
+    }
+
+    #[test]
+    fn send_maybe_delivered_rejects_non_network_errors() {
+        // 下载失败等非 Telegram 网络超时错误不能误判为「已送达」
+        let err = anyhow::anyhow!("Download failed with status: 404 Not Found");
+        assert!(!super::send_maybe_delivered(&err));
     }
 
     #[test]
