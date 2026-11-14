@@ -1,5 +1,5 @@
 # 构建阶段（纯 Rust TLS + 内置 SQLite，无需 OpenSSL 开发库）
-FROM rust:1.88-slim-bookworm AS builder
+FROM rust:slim-bookworm AS builder
 
 WORKDIR /app
 

@@ -14,34 +14,40 @@ pub fn new_search_token() -> String {
     uuid::Uuid::new_v4().simple().to_string()[..8].to_string()
 }
 
-#[derive(BotCommands, Clone)]
-#[command(rename_rule = "lowercase", description = "Jimaku 字幕订阅 Bot 命令:\n")]
-pub enum Command {
-    #[command(description = "显示帮助信息")]
-    Help,
-    #[command(description = "查看服务状态")]
-    Status,
-    #[command(description = "立即触发一次检查")]
-    Checknow,
-    #[command(description = "下载指定 entry 的全部字幕 /download <entry_id>")]
-    Download(String),
-    #[command(
-        rename = "sub",
-        alias = "subscribe",
-        hide_aliases,
-        description = "添加订阅 /sub <entry_id|作品名> [-r NF|Netflix|ATX]"
-    )]
-    Sub(String),
-    #[command(
-        rename = "unsub",
-        alias = "unsubscribe",
-        hide_aliases,
-        description = "取消订阅 /unsub <作品名|entry_id>"
-    )]
-    Unsub(String),
-    #[command(description = "列出当前订阅")]
-    Listsubs,
+#[allow(unreachable_code)]
+mod cmd_def {
+    use teloxide::utils::command::BotCommands;
+
+    #[derive(BotCommands, Clone)]
+    #[command(rename_rule = "lowercase", description = "Jimaku 字幕订阅 Bot 命令:\n")]
+    pub enum Command {
+        #[command(description = "显示帮助信息")]
+        Help,
+        #[command(description = "查看服务状态")]
+        Status,
+        #[command(description = "立即触发一次检查")]
+        Checknow,
+        #[command(description = "下载指定 entry 的全部字幕 /download <entry_id>")]
+        Download(String),
+        #[command(
+            rename = "sub",
+            alias = "subscribe",
+            hide_aliases,
+            description = "添加订阅 /sub <entry_id|作品名> [-r NF|Netflix|ATX]"
+        )]
+        Sub(String),
+        #[command(
+            rename = "unsub",
+            alias = "unsubscribe",
+            hide_aliases,
+            description = "取消订阅 /unsub <作品名|entry_id>"
+        )]
+        Unsub(String),
+        #[command(description = "列出当前订阅")]
+        Listsubs,
+    }
 }
+pub use cmd_def::Command;
 
 pub async fn answer(bot: Bot, msg: Message, cmd: Command, state: AppState) -> ResponseResult<()> {
     let chat_id = msg.chat.id;
