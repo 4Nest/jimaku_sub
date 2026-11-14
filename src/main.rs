@@ -16,9 +16,11 @@ use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, Env
 
 use crate::bot::callbacks::handle_callback;
 use crate::bot::commands::{answer, Command};
+use crate::bot::text::html_escape;
 use crate::bot::AppState;
 use crate::config::{Config, LoggingConfig};
 use crate::database::Database;
+use crate::downloader::Downloader;
 use crate::jimaku::JimakuClient;
 use crate::scheduler::Scheduler;
 use crate::telegram::{ChannelNotifier, TelegramNotifier};
@@ -26,7 +28,7 @@ use crate::telegram::{ChannelNotifier, TelegramNotifier};
 #[tokio::main]
 async fn main() -> Result<()> {
     let config = Config::load().context("Failed to load configuration")?;
-    init_logging(&config.logging).context("Failed to initialize logging")?;
+    let _log_guard = init_logging(&config.logging).context("Failed to initialize logging")?;
 
     info!("Starting Jimaku Subscriber...");
     info!("Configuration loaded successfully");
@@ -37,12 +39,11 @@ async fn main() -> Result<()> {
             .context("Failed to initialize database")?,
     );
 
-    let scheduler_jimaku = JimakuClient::new(&config.jimaku.base_url, &config.jimaku.api_key)
-        .context("Failed to create Jimaku client")?;
-    let command_jimaku = Arc::new(
+    let jimaku = Arc::new(
         JimakuClient::new(&config.jimaku.base_url, &config.jimaku.api_key)
-            .context("Failed to create command Jimaku client")?,
+            .context("Failed to create Jimaku client")?,
     );
+    let downloader = Arc::new(Downloader::new(&config.download.download_path));
 
     let notifier = TelegramNotifier::new(&config.telegram.bot_token, &config.telegram.chat_id)
         .context("Failed to create Telegram notifier")?;
@@ -63,21 +64,27 @@ async fn main() -> Result<()> {
 
     let scheduler = Arc::new(Scheduler::new(
         config.clone(),
-        scheduler_jimaku,
+        jimaku.clone(),
         db.clone(),
+        downloader.clone(),
         notifier.clone(),
         channel,
     ));
+
+    let cancel = CancellationToken::new();
 
     let state = AppState {
         db,
         scheduler: scheduler.clone(),
         config,
-        jimaku: command_jimaku,
+        jimaku,
+        downloader,
         allowed_chat_id: notifier.chat_id(),
+        cancel: cancel.clone(),
     };
 
-    bot::backfill_or_log(&state).await;
+    // 后台按需回填无标题订阅，不阻塞启动
+    bot::spawn_backfill_titles(state.clone());
 
     // 发送启动通知
     let _ = notifier
@@ -92,7 +99,7 @@ async fn main() -> Result<()> {
             } else {
                 "关闭"
             },
-            state.config.download.download_path
+            html_escape(&state.config.download.download_path)
         ))
         .await;
 
@@ -107,8 +114,6 @@ async fn main() -> Result<()> {
         .branch(Update::filter_callback_query().endpoint(handle_callback));
 
     info!("Starting Telegram bot dispatcher...");
-
-    let cancel = CancellationToken::new();
 
     // 启动调度器任务
     let scheduler_clone = scheduler.clone();
@@ -131,11 +136,11 @@ async fn main() -> Result<()> {
     tokio::select! {
         _ = &mut scheduler_handle => {
             error!("Scheduler task ended unexpectedly, exiting for restart");
-            std::process::exit(1);
+            anyhow::bail!("Scheduler task ended unexpectedly");
         }
         _ = &mut bot_handle => {
             error!("Bot task ended unexpectedly, exiting for restart");
-            std::process::exit(1);
+            anyhow::bail!("Bot task ended unexpectedly");
         }
         _ = shutdown_signal() => {
             info!("Shutdown signal received, stopping gracefully...");
@@ -174,7 +179,7 @@ async fn shutdown_signal() {
     let _ = tokio::signal::ctrl_c().await;
 }
 
-fn init_logging(config: &LoggingConfig) -> Result<()> {
+fn init_logging(config: &LoggingConfig) -> Result<tracing_appender::non_blocking::WorkerGuard> {
     fs::create_dir_all(&config.dir).context("Failed to create log directory")?;
     cleanup_old_logs(&config.dir, config.retention_days);
 
@@ -182,7 +187,6 @@ fn init_logging(config: &LoggingConfig) -> Result<()> {
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info,teloxide=warn"));
     let file_appender = tracing_appender::rolling::daily(&config.dir, "jimaku-subscriber.log");
     let (file_writer, guard) = tracing_appender::non_blocking(file_appender);
-    Box::leak(Box::new(guard));
 
     tracing_subscriber::registry()
         .with(env_filter)
@@ -190,11 +194,11 @@ fn init_logging(config: &LoggingConfig) -> Result<()> {
         .with(fmt::layer().with_ansi(false).with_writer(file_writer))
         .init();
 
-    Ok(())
+    Ok(guard)
 }
 
 /// 删除超过保留天数的日志文件（文件名格式 jimaku-subscriber.log.YYYY-MM-DD）
-fn cleanup_old_logs(log_dir: &str, retention_days: u32) {
+pub(crate) fn cleanup_old_logs(log_dir: &str, retention_days: u32) {
     let cutoff = chrono::Utc::now() - chrono::Duration::days(retention_days as i64);
     let entries = match fs::read_dir(log_dir) {
         Ok(entries) => entries,

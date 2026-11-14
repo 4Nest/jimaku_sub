@@ -7,29 +7,32 @@ use tracing::error;
 use crate::bot::keyboards::{
     parse_callback, subscription_panel, unsub_confirm_keyboard, CallbackAction,
 };
-use crate::bot::text::{display_entry_title, html_escape, subscription_card};
+use crate::bot::text::{display_entry_title, html_attr_escape, html_escape, subscription_card};
 use crate::bot::AppState;
 use crate::database::Subscription;
-use crate::downloader::Downloader;
+use crate::downloader::FetchedSubtitle;
+use crate::scheduler::MAX_DOCUMENT_SIZE;
 
 pub async fn handle_callback(
     bot: Bot,
     query: CallbackQuery,
     state: AppState,
 ) -> ResponseResult<()> {
-    if let Some(message) = query.message.as_ref() {
-        if !state.is_allowed(message.chat().id) {
-            bot.answer_callback_query(&query.id)
-                .text("⛔ 无权限使用此 Bot")
-                .await?;
-            return Ok(());
-        }
+    let Some(message) = query.message.as_ref() else {
+        bot.answer_callback_query(&query.id).await?;
+        return Ok(());
+    };
+    if !state.is_allowed(message.chat().id) {
+        bot.answer_callback_query(&query.id)
+            .text("⛔ 无权限使用此 Bot")
+            .await?;
+        return Ok(());
     }
 
     let Some(data) = query.data.as_deref() else {
+        bot.answer_callback_query(&query.id).await?;
         return Ok(());
     };
-
     match parse_callback(data) {
         Some(CallbackAction::DownloadFile(file_id)) => {
             handle_download_file(&bot, &query, &state, file_id).await?;
@@ -58,11 +61,9 @@ pub async fn handle_callback(
         }
         Some(CallbackAction::UnsubAsk(entry_id)) => {
             bot.answer_callback_query(&query.id).await?;
-            if let Some(message) = query.message.as_ref() {
-                bot.edit_message_reply_markup(message.chat().id, message.id())
-                    .reply_markup(unsub_confirm_keyboard(entry_id))
-                    .await?;
-            }
+            bot.edit_message_reply_markup(message.chat().id, message.id())
+                .reply_markup(unsub_confirm_keyboard(entry_id))
+                .await?;
         }
         Some(CallbackAction::UnsubConfirm(entry_id)) => {
             bot.answer_callback_query(&query.id).await?;
@@ -305,17 +306,51 @@ async fn handle_download_file(
         .text("⏳ 正在准备文件...")
         .await?;
 
-    let downloader = Downloader::new(&state.config.download.download_path);
-    let local = downloader.local_path(&record.entry_name, &record.file_name);
+    if record
+        .file_size
+        .is_some_and(|s| s > 0 && (s as u64) > MAX_DOCUMENT_SIZE)
+    {
+        send_oversize_hint(bot, chat_id, &record.file_name, &record.file_url).await?;
+        return Ok(());
+    }
 
-    // 本地已有文件直接用，否则现下载
-    let path = match tokio::fs::metadata(&local).await {
-        Ok(meta) if meta.len() > 0 => local,
-        _ => match downloader
-            .download_subtitle(&record.entry_name, &record.file_name, &record.file_url)
+    let local = state
+        .downloader
+        .local_path(&record.entry_name, &record.file_name);
+
+    // 1) 本地已有完好文件则直接发送
+    if let Ok(meta) = tokio::fs::metadata(&local).await {
+        if meta.len() > 0 {
+            if meta.len() > MAX_DOCUMENT_SIZE {
+                send_oversize_hint(bot, chat_id, &record.file_name, &record.file_url).await?;
+                return Ok(());
+            }
+            if let Err(e) = bot.send_document(chat_id, InputFile::file(&local)).await {
+                error!("Failed to send document {:?}: {}", local, e);
+                bot.send_message(chat_id, "❌ 文件发送失败，请稍后重试")
+                    .await?;
+            }
+            return Ok(());
+        }
+    }
+
+    // 2) 判断是否需要落盘保存（遵循订阅级 auto_download 或全局 download.enabled）
+    let persist_to_disk = state
+        .db
+        .get_subscription(record.entry_id)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|sub| sub.auto_download)
+        .unwrap_or(state.config.download.enabled);
+
+    if persist_to_disk {
+        match state
+            .downloader
+            .download_subtitle_with_outcome(&record.entry_name, &record.file_name, &record.file_url)
             .await
         {
-            Ok(path) => {
+            Ok(outcome) => {
                 let _ = state
                     .db
                     .record_file(
@@ -327,7 +362,18 @@ async fn handle_download_file(
                         true,
                     )
                     .await;
-                path
+                if outcome.size > MAX_DOCUMENT_SIZE {
+                    send_oversize_hint(bot, chat_id, &record.file_name, &record.file_url).await?;
+                    return Ok(());
+                }
+                if let Err(e) = bot
+                    .send_document(chat_id, InputFile::file(&outcome.path))
+                    .await
+                {
+                    error!("Failed to send document {:?}: {}", outcome.path, e);
+                    bot.send_message(chat_id, "❌ 文件发送失败，请稍后重试")
+                        .await?;
+                }
             }
             Err(e) => {
                 error!("Failed to download subtitle {}: {}", record.file_name, e);
@@ -340,16 +386,58 @@ async fn handle_download_file(
                 )
                 .parse_mode(ParseMode::Html)
                 .await?;
-                return Ok(());
             }
-        },
-    };
-
-    if let Err(e) = bot.send_document(chat_id, InputFile::file(&path)).await {
-        error!("Failed to send document {:?}: {}", path, e);
-        bot.send_message(chat_id, "❌ 文件发送失败，请稍后重试")
-            .await?;
+        }
+    } else {
+        match state
+            .downloader
+            .fetch_subtitle_bytes(&record.file_url, MAX_DOCUMENT_SIZE as usize)
+            .await
+        {
+            Ok(FetchedSubtitle::Bytes(data)) => {
+                let input = InputFile::memory(data).file_name(record.file_name.clone());
+                if let Err(e) = bot.send_document(chat_id, input).await {
+                    error!("Failed to send memory document {}: {}", record.file_name, e);
+                    bot.send_message(chat_id, "❌ 文件发送失败，请稍后重试")
+                        .await?;
+                }
+            }
+            Ok(FetchedSubtitle::TooLarge) => {
+                send_oversize_hint(bot, chat_id, &record.file_name, &record.file_url).await?;
+            }
+            Err(e) => {
+                error!("Failed to fetch subtitle {}: {}", record.file_name, e);
+                bot.send_message(
+                    chat_id,
+                    format!(
+                        "❌ 下载失败: <code>{}</code>",
+                        html_escape(&record.file_name)
+                    ),
+                )
+                .parse_mode(ParseMode::Html)
+                .await?;
+            }
+        }
     }
 
+    Ok(())
+}
+
+async fn send_oversize_hint(
+    bot: &Bot,
+    chat_id: ChatId,
+    file_name: &str,
+    file_url: &str,
+) -> ResponseResult<()> {
+    bot.send_message(
+        chat_id,
+        format!(
+            "⚠️ <code>{}</code> 超过 Telegram 发送上限 (48MB)，请<a href=\"{}\">点击直链下载</a>",
+            html_escape(file_name),
+            html_attr_escape(file_url)
+        ),
+    )
+    .parse_mode(ParseMode::Html)
+    .await?;
     Ok(())
 }

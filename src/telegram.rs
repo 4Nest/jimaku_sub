@@ -3,7 +3,7 @@ use chrono::{DateTime, Utc};
 use teloxide::adaptors::throttle::Limits;
 use teloxide::adaptors::Throttle;
 use teloxide::prelude::*;
-use teloxide::types::ParseMode;
+use teloxide::types::{InputFile, ParseMode};
 use tracing::info;
 
 /// 通知用 Bot：带限流，自动遵循 Telegram API 速率限制并在 429 时等待重试
@@ -24,12 +24,37 @@ pub struct NewSubtitle<'a> {
     pub downloaded: bool,
 }
 
+/// Telegram 文档来源：本地已落盘路径，或不落盘的内存字节流
+pub enum DocumentSource<'a> {
+    Path(&'a std::path::Path),
+    Memory { file_name: &'a str, data: Vec<u8> },
+}
+
+impl DocumentSource<'_> {
+    pub fn into_input_file(self) -> InputFile {
+        match self {
+            Self::Path(path) => InputFile::file(path),
+            Self::Memory { file_name, data } => {
+                InputFile::memory(data).file_name(file_name.to_string())
+            }
+        }
+    }
+
+    fn label(&self) -> String {
+        match self {
+            Self::Path(path) => format!("{:?}", path),
+            Self::Memory { file_name, data } => {
+                format!("{} ({} bytes, memory)", file_name, data.len())
+            }
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct TelegramNotifier {
     bot: ThrottledBot,
     chat_id: ChatId,
 }
-
 impl TelegramNotifier {
     pub fn new(bot_token: impl Into<String>, chat_id: impl Into<String>) -> Result<Self> {
         let bot = Bot::new(bot_token.into()).throttle(Limits::default());
@@ -62,12 +87,13 @@ impl TelegramNotifier {
         Ok(())
     }
 
-    /// 把本地文件作为 Telegram 文档发送
-    pub async fn send_document(&self, path: &std::path::Path) -> Result<()> {
+    /// 发送字幕文档到私聊（支持本地文件或内存字节流）
+    pub async fn send_document(&self, source: DocumentSource<'_>) -> Result<()> {
+        let label = source.label();
         self.bot
-            .send_document(self.chat_id, teloxide::types::InputFile::file(path))
+            .send_document(self.chat_id, source.into_input_file())
             .await?;
-        info!("Telegram document sent: {:?}", path);
+        info!("Telegram document sent: {}", label);
         Ok(())
     }
 
@@ -114,19 +140,20 @@ impl ChannelNotifier {
     /// 发送字幕文件到频道，Caption 为 MarkdownV2（≤1024 字符）
     pub async fn send_subtitle_document(
         &self,
-        path: &std::path::Path,
+        source: DocumentSource<'_>,
         caption: &str,
     ) -> Result<()> {
+        let label = source.label();
         self.bot
-            .send_document(self.chat_id, teloxide::types::InputFile::file(path))
+            .send_document(self.chat_id, source.into_input_file())
             .caption(caption)
             .parse_mode(ParseMode::MarkdownV2)
             .await?;
-        info!("Channel document sent: {:?}", path);
+        info!("Channel document sent: {}", label);
         Ok(())
     }
 
-    /// 发送文字卡片到频道（MarkdownV2，启动确认、超大文件的链接卡片等）
+    /// 发送文字卡片到频道（MarkdownV2，超大文件的链接卡片等）
     pub async fn send_text_card(&self, text: &str) -> Result<()> {
         self.bot
             .send_message(self.chat_id, text)

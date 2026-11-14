@@ -1,7 +1,10 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
-use reqwest::header::{self, HeaderMap, HeaderValue};
-use serde::{Deserialize, Serialize};
+use reqwest::{
+    header::{self, HeaderMap, HeaderValue},
+    StatusCode, Url,
+};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::Value;
 use tracing::debug;
 
@@ -35,15 +38,14 @@ pub struct FileEntry {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct ApiError {
-    pub message: String,
+struct ApiError {
+    message: String,
 }
 
+#[derive(Clone)]
 pub struct JimakuClient {
     client: reqwest::Client,
     base_url: String,
-    #[allow(dead_code)]
-    api_key: String,
 }
 
 impl JimakuClient {
@@ -57,14 +59,13 @@ impl JimakuClient {
         let client = reqwest::Client::builder()
             .default_headers(headers)
             .timeout(std::time::Duration::from_secs(30))
+            .connect_timeout(std::time::Duration::from_secs(10))
             .build()
             .context("Failed to build HTTP client")?;
 
-        Ok(Self {
-            client,
-            base_url: base_url.into(),
-            api_key,
-        })
+        let base_url = base_url.into().trim().trim_end_matches('/').to_string();
+
+        Ok(Self { client, base_url })
     }
 
     pub async fn search_entries(
@@ -72,162 +73,123 @@ impl JimakuClient {
         after: Option<i64>,
         before: Option<i64>,
     ) -> Result<Vec<Entry>> {
-        let mut url = format!("{}/api/entries/search", self.base_url);
-        let mut params = vec![];
+        let endpoint = format!("{}/api/entries/search", self.base_url);
+        let mut params = Vec::with_capacity(2);
         if let Some(ts) = after {
-            params.push(format!("after={}", ts));
+            params.push(("after", ts.to_string()));
         }
         if let Some(ts) = before {
-            params.push(format!("before={}", ts));
+            params.push(("before", ts.to_string()));
         }
-        if !params.is_empty() {
-            url.push('?');
-            url.push_str(&params.join("&"));
-        }
-
+        let url = Url::parse_with_params(&endpoint, &params)
+            .context("Failed to build Jimaku search URL")?;
         debug!("Jimaku search URL: {}", url);
-
-        let resp = self
-            .client
-            .get(&url)
-            .send()
-            .await
-            .context("Failed to send search request")?;
-
-        let status = resp.status();
-        let body = resp.text().await.context("Failed to read response body")?;
-
-        if !status.is_success() {
-            if let Ok(err) = serde_json::from_str::<ApiError>(&body) {
-                anyhow::bail!("Jimaku API error ({}): {}", status, err.message);
-            }
-            anyhow::bail!("Jimaku API error ({}): {}", status, body);
-        }
-
-        let entries: Vec<Entry> =
-            serde_json::from_str(&body).context("Failed to parse entries response")?;
-        Ok(entries)
+        self.get_json(url, "entries search").await
     }
 
     pub async fn search_entries_by_query(&self, query: &str) -> Result<Vec<Entry>> {
-        let url = reqwest::Url::parse_with_params(
+        let url = Url::parse_with_params(
             &format!("{}/api/entries/search", self.base_url),
             &[("query", query)],
         )
         .context("Failed to build Jimaku query URL")?;
-
         debug!("Jimaku query URL: {}", url);
+        self.get_json(url, "entries query").await
+    }
 
+    pub async fn get_entry_files(&self, entry_id: i64) -> Result<Vec<FileEntry>> {
+        let url = Url::parse(&format!("{}/api/entries/{}/files", self.base_url, entry_id))
+            .context("Failed to build Jimaku entry files URL")?;
+        match self.get_json_opt(url, "entry files").await? {
+            Some(files) => Ok(files),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    pub async fn get_entry_by_id(&self, entry_id: i64) -> Result<Entry> {
+        let url = Url::parse(&format!("{}/api/entries/{}", self.base_url, entry_id))
+            .context("Failed to build Jimaku entry URL")?;
+        self.get_json(url, "entry details").await
+    }
+
+    async fn get_json<T: DeserializeOwned>(&self, url: Url, label: &str) -> Result<T> {
+        let (status, body) = self.fetch_body(url, label).await?;
+        if !status.is_success() {
+            return Err(api_error(status, &body));
+        }
+        serde_json::from_str(&body).with_context(|| format!("Failed to parse {label} response"))
+    }
+
+    async fn get_json_opt<T: DeserializeOwned>(&self, url: Url, label: &str) -> Result<Option<T>> {
+        let (status, body) = self.fetch_body(url, label).await?;
+        if status == StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if !status.is_success() {
+            return Err(api_error(status, &body));
+        }
+        let parsed = serde_json::from_str(&body)
+            .with_context(|| format!("Failed to parse {label} response"))?;
+        Ok(Some(parsed))
+    }
+
+    async fn fetch_body(&self, url: Url, label: &str) -> Result<(StatusCode, String)> {
         let resp = self
             .client
             .get(url)
             .send()
             .await
-            .context("Failed to send query request")?;
-
+            .with_context(|| format!("Failed to send {label} request"))?;
         let status = resp.status();
-        let body = resp.text().await.context("Failed to read response body")?;
-
-        if !status.is_success() {
-            if let Ok(err) = serde_json::from_str::<ApiError>(&body) {
-                anyhow::bail!("Jimaku API error ({}): {}", status, err.message);
-            }
-            anyhow::bail!("Jimaku API error ({}): {}", status, body);
-        }
-
-        let entries: Vec<Entry> =
-            serde_json::from_str(&body).context("Failed to parse query response")?;
-        Ok(entries)
-    }
-
-    pub async fn get_entry_files(&self, entry_id: i64) -> Result<Vec<FileEntry>> {
-        let url = format!("{}/api/entries/{}/files", self.base_url, entry_id);
-
-        let resp = self
-            .client
-            .get(&url)
-            .send()
+        let body = resp
+            .text()
             .await
-            .context("Failed to send files request")?;
-
-        let status = resp.status();
-        let body = resp.text().await.context("Failed to read response body")?;
-
-        if status == 404 {
-            return Ok(vec![]);
-        }
-
-        if !status.is_success() {
-            if let Ok(err) = serde_json::from_str::<ApiError>(&body) {
-                anyhow::bail!("Jimaku API error ({}): {}", status, err.message);
-            }
-            anyhow::bail!("Jimaku API error ({}): {}", status, body);
-        }
-
-        let files: Vec<FileEntry> =
-            serde_json::from_str(&body).context("Failed to parse files response")?;
-        Ok(files)
+            .with_context(|| format!("Failed to read {label} response body"))?;
+        Ok((status, body))
     }
 
-    #[allow(dead_code)]
-    pub async fn get_entry_by_id(&self, entry_id: i64) -> Result<Entry> {
-        let url = format!("{}/api/entries/{}", self.base_url, entry_id);
-
-        let resp = self
-            .client
-            .get(&url)
-            .send()
-            .await
-            .context("Failed to send entry details request")?;
-
-        let status = resp.status();
-        let body = resp.text().await.context("Failed to read response body")?;
-
-        if !status.is_success() {
-            if let Ok(err) = serde_json::from_str::<ApiError>(&body) {
-                anyhow::bail!("Jimaku API error ({}): {}", status, err.message);
-            }
-            anyhow::bail!("Jimaku API error ({}): {}", status, body);
-        }
-
-        let entry: Entry = serde_json::from_str(&body).context("Failed to parse entry response")?;
-        Ok(entry)
-    }
-
-    /// 检查条目是否匹配订阅条件
+    /// 检查条目是否匹配订阅条件（调用方应确保至少有一项过滤条件非空）
     pub fn matches_subscription(
         entry: &Entry,
         anilist_ids: &[i32],
         name_keywords: &[String],
     ) -> bool {
-        // 无条件 = 全部订阅
         if anilist_ids.is_empty() && name_keywords.is_empty() {
-            return true;
+            return false;
         }
 
-        // 检查 anilist_id
         if let Some(aid) = entry.anilist_id {
             if anilist_ids.contains(&aid) {
                 return true;
             }
         }
 
-        // 检查关键词（name, english_name, japanese_name）
-        let haystack = format!(
-            "{} {} {}",
-            entry.name,
-            entry.english_name.as_deref().unwrap_or(""),
-            entry.japanese_name.as_deref().unwrap_or("")
-        )
-        .to_lowercase();
-
-        for kw in name_keywords {
-            if haystack.contains(&kw.to_lowercase()) {
-                return true;
-            }
+        if name_keywords.is_empty() {
+            return false;
         }
 
-        false
+        let name_lower = entry.name.to_lowercase();
+        let en_lower = entry.english_name.as_deref().map(str::to_lowercase);
+        let ja_lower = entry.japanese_name.as_deref().map(str::to_lowercase);
+
+        name_keywords
+            .iter()
+            .map(|kw| kw.trim())
+            .filter(|kw| !kw.is_empty())
+            .any(|kw| {
+                let kw = kw.to_lowercase();
+                name_lower.contains(&kw)
+                    || en_lower.as_deref().is_some_and(|s| s.contains(&kw))
+                    || ja_lower.as_deref().is_some_and(|s| s.contains(&kw))
+            })
+    }
+}
+
+fn api_error(status: StatusCode, body: &str) -> anyhow::Error {
+    if let Ok(err) = serde_json::from_str::<ApiError>(body) {
+        anyhow::anyhow!("Jimaku API error ({}): {}", status, err.message)
+    } else {
+        anyhow::anyhow!("Jimaku API error ({}): {}", status, body)
     }
 }
 
@@ -247,7 +209,8 @@ fn normalize_api_key(api_key: String) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{normalize_api_key, Entry};
+    use super::{normalize_api_key, Entry, JimakuClient};
+    use chrono::Utc;
 
     #[test]
     fn normalizes_common_api_key_wrappers() {
@@ -272,5 +235,32 @@ mod tests {
         let entry: Entry = serde_json::from_str(raw).unwrap();
         assert_eq!(entry.id, 11787);
         assert_eq!(entry.flags, serde_json::json!({}));
+    }
+
+    #[test]
+    fn empty_or_blank_subscription_filters_never_match() {
+        let entry = Entry {
+            id: 1,
+            name: "Show".to_string(),
+            english_name: None,
+            japanese_name: None,
+            anilist_id: Some(42),
+            tmdb_id: None,
+            last_modified: Utc::now(),
+            flags: serde_json::json!({}),
+            notes: None,
+            creator_id: None,
+        };
+        assert!(!JimakuClient::matches_subscription(&entry, &[], &[]));
+        assert!(!JimakuClient::matches_subscription(
+            &entry,
+            &[],
+            &["   ".to_string()]
+        ));
+        assert!(JimakuClient::matches_subscription(
+            &entry,
+            &[],
+            &["show".to_string()]
+        ));
     }
 }

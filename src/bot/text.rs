@@ -41,7 +41,7 @@ pub fn new_subtitle_card(sub: &NewSubtitle<'_>) -> String {
         language_line,
         size_str,
         format_time(sub.file_modified),
-        sub.file_url,
+        html_attr_escape(sub.file_url),
         sub.entry_id,
         download_status
     )
@@ -124,6 +124,12 @@ pub fn html_escape(text: &str) -> String {
     text.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
+}
+
+pub fn html_attr_escape(text: &str) -> String {
+    html_escape(text)
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
 }
 
 /// 文件大小格式化（B / KB / MB）
@@ -247,13 +253,12 @@ fn sanitize_hashtag(name: &str) -> String {
 /// 频道文件消息的 Caption（MarkdownV2，≤1024 字符）
 pub fn channel_caption(sub: &ChannelSubtitle<'_>) -> String {
     let text = channel_body(sub);
-    // Telegram 上限按字符计（Rust len() 是字节数，CJK 会虚高 3 倍）
-    debug_assert!(
-        text.chars().count() <= CAPTION_LIMIT,
-        "caption exceeds limit: {} chars",
-        text.chars().count()
-    );
-    text
+    // LINE_LIMIT 已控制各段长度；极端大量转义符时仍保证不突破 Telegram 1024 字符硬上限
+    if text.chars().count() <= CAPTION_LIMIT {
+        text
+    } else {
+        truncate(&text, CAPTION_LIMIT).to_string()
+    }
 }
 
 /// 超过发送上限的文件：频道文字卡片（附 jimaku 下载直链）
@@ -317,9 +322,9 @@ pub fn format_subscriptions(subs: &[Subscription]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        channel_caption, channel_link_card, detect_language, format_size, ChannelSubtitle,
+        channel_caption, channel_link_card, detect_language, format_size, html_attr_escape,
+        ChannelSubtitle,
     };
-
     fn sub(ja: Option<&str>) -> ChannelSubtitle<'_> {
         ChannelSubtitle {
             japanese_name: ja,
@@ -428,5 +433,13 @@ mod tests {
         assert!(c.contains("jimaku.cc/entry/11783"));
         assert!(c.contains("超过发送上限"));
         assert!(c.contains("\\#日"));
+    }
+
+    #[test]
+    fn escapes_html_attribute_special_chars() {
+        assert_eq!(
+            html_attr_escape("https://jimaku.cc/f?a=1&b=\"2\""),
+            "https://jimaku.cc/f?a=1&amp;b=&quot;2&quot;"
+        );
     }
 }

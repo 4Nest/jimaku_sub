@@ -1,25 +1,27 @@
 use crate::{
-    bot::text::{channel_caption, channel_link_card, ChannelSubtitle},
+    bot::text::{channel_caption, channel_link_card, html_escape, ChannelSubtitle},
     config::Config,
-    database::Database,
-    downloader::Downloader,
+    database::{Database, Subscription},
+    downloader::{Downloader, FetchedSubtitle},
     jimaku::{Entry, FileEntry, JimakuClient},
-    telegram::{ChannelNotifier, NewSubtitle, TelegramNotifier},
+    telegram::{ChannelNotifier, DocumentSource, NewSubtitle, TelegramNotifier},
 };
 use anyhow::Result;
-use chrono::{DateTime, Utc};
-use std::sync::Arc;
+use chrono::{DateTime, NaiveDate, Utc};
+use std::{collections::HashMap, sync::Arc};
 use tokio::time::{interval, Duration};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 pub struct Scheduler {
     config: Config,
-    jimaku: JimakuClient,
+    jimaku: Arc<JimakuClient>,
     db: Arc<Database>,
     notifier: TelegramNotifier,
     channel: Option<ChannelNotifier>,
-    downloader: Downloader,
+    downloader: Arc<Downloader>,
+    check_lock: tokio::sync::Mutex<()>,
+    last_log_cleanup: std::sync::Mutex<Option<NaiveDate>>,
 }
 
 /// 一个 entry 命中订阅后聚合出的处理策略
@@ -35,13 +37,12 @@ struct EntryPolicy {
 impl Scheduler {
     pub fn new(
         config: Config,
-        jimaku: JimakuClient,
+        jimaku: Arc<JimakuClient>,
         db: Arc<Database>,
+        downloader: Arc<Downloader>,
         notifier: TelegramNotifier,
         channel: Option<ChannelNotifier>,
     ) -> Self {
-        let downloader = Downloader::new(&config.download.download_path);
-
         Self {
             config,
             jimaku,
@@ -49,21 +50,28 @@ impl Scheduler {
             notifier,
             channel,
             downloader,
+            check_lock: tokio::sync::Mutex::new(()),
+            last_log_cleanup: std::sync::Mutex::new(None),
         }
     }
 
     pub async fn run(self: Arc<Self>, cancel: CancellationToken) -> Result<()> {
         let mut ticker = interval(Duration::from_secs(self.config.scheduler.interval_seconds));
+        // Consume the immediate first tick so the manual initial check doesn't double-run.
+        ticker.tick().await;
 
-        // 首次立即执行一次
-        if let Err(e) = self.check_once().await {
+        // 启动即写一次心跳，避免首轮积压推送耗时较长导致容器启动期被标为 unhealthy
+        self.write_heartbeat().await;
+
+        if let Err(e) = self.check_scheduled(&cancel).await {
             error!("Initial check failed: {}", e);
         }
 
         loop {
             tokio::select! {
                 _ = ticker.tick() => {
-                    if let Err(e) = self.check_once().await {
+                    self.maybe_cleanup_logs();
+                    if let Err(e) = self.check_scheduled(&cancel).await {
                         error!("Scheduled check failed: {}", e);
                     }
                 }
@@ -75,25 +83,56 @@ impl Scheduler {
         }
     }
 
-    pub async fn check_once(&self) -> Result<()> {
+    /// 定时任务触发检查（串行等待锁）
+    async fn check_scheduled(&self, cancel: &CancellationToken) -> Result<()> {
+        let _guard = self.check_lock.lock().await;
+        if cancel.is_cancelled() {
+            return Ok(());
+        }
+        self.check_inner(cancel).await
+    }
+
+    /// `/checknow` 手动触发检查：若已有检查在跑立即返回 `Ok(false)`，避免并发重入与重复推送
+    pub async fn try_check_now(&self, cancel: &CancellationToken) -> Result<bool> {
+        let Ok(_guard) = self.check_lock.try_lock() else {
+            return Ok(false);
+        };
+        self.check_inner(cancel).await?;
+        Ok(true)
+    }
+
+    pub fn is_checking(&self) -> bool {
+        self.check_lock.try_lock().is_err()
+    }
+
+    fn maybe_cleanup_logs(&self) {
+        let today = Utc::now().date_naive();
+        if let Ok(mut guard) = self.last_log_cleanup.lock() {
+            if *guard == Some(today) {
+                return;
+            }
+            *guard = Some(today);
+        }
+        crate::cleanup_old_logs(&self.config.logging.dir, self.config.logging.retention_days);
+    }
+
+    async fn check_inner(&self, cancel: &CancellationToken) -> Result<()> {
         info!("Starting Jimaku check...");
 
         let last_check = self.db.get_last_check_time().await?;
-        let now = chrono::Utc::now().timestamp();
+        let now = Utc::now().timestamp();
 
-        // 首次运行：检查最近1小时的条目
+        // 首次运行：检查最近 1 小时的条目
         let after = last_check.unwrap_or(now - 3600);
-
         debug!("Checking entries after timestamp: {}", after);
 
-        let entries = self.search_entries_with_retry(after).await?;
-        info!("Found {} entries since last check", entries.len());
+        let dynamic_subs = self.db.list_subscriptions().await?;
 
-        // 频道推送：写入/读取基线时间，并先独立重试上轮遗留的占位行
+        // 1) 独立重试上轮遗留的频道推送占位行
         let channel_baseline = if self.channel.is_some() {
             match self.db.ensure_channel_enabled_at(Utc::now()).await {
                 Ok(baseline) => {
-                    if let Err(e) = self.retry_channel_pending().await {
+                    if let Err(e) = self.retry_channel_pending(cancel).await {
                         error!("Failed to retry pending channel files: {}", e);
                     }
                     Some(baseline)
@@ -107,25 +146,39 @@ impl Scheduler {
             None
         };
 
-        // 合并配置文件订阅和数据库动态订阅
-        // 注意：无任何订阅 = 不推送（全量推送请用频道功能 CHANNEL_ENABLED）
-        let dynamic_subs = self.db.list_subscriptions().await?;
-        let config_anilist_ids = &self.config.subscription.anilist_ids;
-        let config_keywords = &self.config.subscription.name_keywords;
+        if cancel.is_cancelled() {
+            return Ok(());
+        }
+
+        // 2) 独立重试上轮遗留的私聊通知占位行（notified=0）
+        if let Err(e) = self
+            .retry_pending_notifications(&dynamic_subs, cancel)
+            .await
+        {
+            error!("Failed to retry pending notifications: {}", e);
+        }
+
+        if cancel.is_cancelled() {
+            return Ok(());
+        }
+
+        let entries = match self.search_entries_with_retry(after, cancel).await {
+            Ok(Some(entries)) => entries,
+            Ok(None) => return Ok(()),
+            Err(e) => return Err(e),
+        };
+        info!("Found {} entries since last check", entries.len());
+
+        let mut had_entry_error = false;
 
         for entry in entries {
-            let config_match = if config_anilist_ids.is_empty() && config_keywords.is_empty() {
-                false
-            } else {
-                JimakuClient::matches_subscription(&entry, config_anilist_ids, config_keywords)
-            };
-            let matching_dynamic_subs = dynamic_subs
-                .iter()
-                .filter(|sub| entry.id == sub.entry_id)
-                .collect::<Vec<_>>();
+            if cancel.is_cancelled() {
+                info!("Check interrupted by shutdown; keeping previous last_check_time");
+                return Ok(());
+            }
 
-            let sub_matched = config_match || !matching_dynamic_subs.is_empty();
-            if !sub_matched && self.channel.is_none() {
+            let policy = self.resolve_entry_policy(&entry, &dynamic_subs);
+            if policy.is_none() && self.channel.is_none() {
                 debug!("Entry {} does not match subscription, skipping", entry.id);
                 continue;
             }
@@ -135,6 +188,7 @@ impl Scheduler {
                 Ok(files) => files,
                 Err(e) => {
                     error!("Failed to get files for entry {}: {}", entry.id, e);
+                    had_entry_error = true;
                     continue;
                 }
             };
@@ -142,89 +196,140 @@ impl Scheduler {
                 continue;
             }
 
+            let persist_for_channel =
+                self.config.download.enabled || policy.as_ref().is_some_and(|p| p.auto_download);
+
             // 频道全量推送（先于订阅路径，不走订阅匹配）
             if let (Some(_), Some(baseline)) = (&self.channel, channel_baseline) {
-                self.process_channel_entry(&entry, &files, baseline).await;
+                self.process_channel_entry(&entry, &files, baseline, persist_for_channel, cancel)
+                    .await;
             }
 
-            if !sub_matched {
-                debug!("Entry {} does not match subscription, skipping", entry.id);
-                continue;
+            if cancel.is_cancelled() {
+                info!("Check interrupted by shutdown; keeping previous last_check_time");
+                return Ok(());
             }
 
-            let keyword_filter = if config_match
-                || matching_dynamic_subs
-                    .iter()
-                    .any(|sub| sub.keywords.is_empty())
-            {
-                None
-            } else {
-                let keywords = matching_dynamic_subs
-                    .iter()
-                    .flat_map(|sub| sub.keywords.iter().cloned())
-                    .collect::<Vec<_>>();
-                Some(keywords)
-            };
-
-            // 配置订阅命中：沿用全局策略；动态订阅命中：聚合订阅级策略
-            let policy = if config_match {
-                EntryPolicy {
-                    keyword_filter,
-                    notify: true,
-                    auto_download: self.config.download.enabled,
-                    send_file: false,
+            if let Some(policy) = policy {
+                if let Err(e) = self.process_entry(&entry, files, &policy, cancel).await {
+                    error!("Failed to process entry {}: {}", entry.id, e);
+                    had_entry_error = true;
                 }
-            } else {
-                let explicit_download: Vec<bool> = matching_dynamic_subs
-                    .iter()
-                    .filter_map(|sub| sub.auto_download)
-                    .collect();
-                let auto_download = if explicit_download.is_empty() {
-                    self.config.download.enabled
-                } else {
-                    explicit_download.iter().any(|enabled| *enabled)
-                };
-                EntryPolicy {
-                    keyword_filter,
-                    notify: matching_dynamic_subs.iter().any(|sub| !sub.muted),
-                    auto_download,
-                    send_file: matching_dynamic_subs.iter().any(|sub| sub.send_file),
-                }
-            };
-
-            if let Err(e) = self.process_entry(&entry, files, &policy).await {
-                error!("Failed to process entry {}: {}", entry.id, e);
             }
+
+            self.write_heartbeat().await;
         }
 
-        self.db.set_last_check_time(now).await?;
+        if cancel.is_cancelled() {
+            return Ok(());
+        }
+
+        if had_entry_error {
+            warn!(
+                "One or more entries failed to process; keeping previous last_check_time for retry"
+            );
+        } else {
+            self.db.set_last_check_time(now).await?;
+        }
+
         self.write_heartbeat().await;
         info!("Jimaku check completed");
         Ok(())
     }
 
-    /// Jimaku 搜索失败时有限重试（指数退避 1s/2s/4s）
-    async fn search_entries_with_retry(&self, after: i64) -> Result<Vec<Entry>> {
+    /// 计算 entry 命中的订阅策略；未命中任何配置/动态订阅时返回 `None`
+    fn resolve_entry_policy(
+        &self,
+        entry: &Entry,
+        dynamic_subs: &[Subscription],
+    ) -> Option<EntryPolicy> {
+        let config_anilist_ids = &self.config.subscription.anilist_ids;
+        let config_keywords = &self.config.subscription.name_keywords;
+
+        let config_match = if config_anilist_ids.is_empty() && config_keywords.is_empty() {
+            false
+        } else {
+            JimakuClient::matches_subscription(entry, config_anilist_ids, config_keywords)
+        };
+
+        let matching_dynamic_subs: Vec<&Subscription> = dynamic_subs
+            .iter()
+            .filter(|sub| entry.id == sub.entry_id)
+            .collect();
+
+        if !config_match && matching_dynamic_subs.is_empty() {
+            return None;
+        }
+
+        let keyword_filter = if config_match
+            || matching_dynamic_subs
+                .iter()
+                .any(|sub| sub.keywords.is_empty())
+        {
+            None
+        } else {
+            Some(
+                matching_dynamic_subs
+                    .iter()
+                    .flat_map(|sub| sub.keywords.iter().cloned())
+                    .collect(),
+            )
+        };
+
+        if config_match {
+            Some(EntryPolicy {
+                keyword_filter,
+                notify: true,
+                auto_download: self.config.download.enabled,
+                send_file: false,
+            })
+        } else {
+            let explicit_download: Vec<bool> = matching_dynamic_subs
+                .iter()
+                .filter_map(|sub| sub.auto_download)
+                .collect();
+            let auto_download = if explicit_download.is_empty() {
+                self.config.download.enabled
+            } else {
+                explicit_download.into_iter().any(|enabled| enabled)
+            };
+            Some(EntryPolicy {
+                keyword_filter,
+                notify: matching_dynamic_subs.iter().any(|sub| !sub.muted),
+                auto_download,
+                send_file: matching_dynamic_subs.iter().any(|sub| sub.send_file),
+            })
+        }
+    }
+
+    /// Jimaku 搜索失败时有限重试（指数退避 1s/2s/4s），收到停机信号立即返回 `Ok(None)`
+    async fn search_entries_with_retry(
+        &self,
+        after: i64,
+        cancel: &CancellationToken,
+    ) -> Result<Option<Vec<Entry>>> {
         const MAX_ATTEMPTS: u32 = 3;
         let mut attempt = 0;
         loop {
             attempt += 1;
             match self.jimaku.search_entries(Some(after), None).await {
-                Ok(entries) => return Ok(entries),
+                Ok(entries) => return Ok(Some(entries)),
                 Err(e) if attempt < MAX_ATTEMPTS => {
                     let backoff = Duration::from_secs(1 << (attempt - 1));
                     warn!(
                         "Jimaku search failed (attempt {}/{}): {}, retrying in {:?}",
                         attempt, MAX_ATTEMPTS, e, backoff
                     );
-                    tokio::time::sleep(backoff).await;
+                    if !cancellable_sleep(backoff, cancel).await {
+                        return Ok(None);
+                    }
                 }
                 Err(e) => return Err(e),
             }
         }
     }
 
-    /// 每轮成功 check 后刷新心跳文件，供 Docker healthcheck 使用
+    /// 每轮成功 check 或处理进度推进后刷新心跳文件，供 Docker healthcheck 使用
     async fn write_heartbeat(&self) {
         if let Err(e) = tokio::fs::write("/tmp/jimaku_heartbeat", b"ok").await {
             warn!("Failed to write heartbeat file: {}", e);
@@ -236,8 +341,15 @@ impl Scheduler {
         entry: &Entry,
         files: Vec<FileEntry>,
         policy: &EntryPolicy,
+        cancel: &CancellationToken,
     ) -> Result<()> {
+        let handled_urls = self.db.get_handled_notified_urls(entry.id).await?;
+
         for file in files {
+            if cancel.is_cancelled() {
+                return Ok(());
+            }
+
             if let Some(keywords) = policy.keyword_filter.as_deref() {
                 if !file_matches_keywords(&file.name, keywords) {
                     debug!(
@@ -248,23 +360,23 @@ impl Scheduler {
                 }
             }
 
-            if self.db.is_file_notified(&file.url).await? {
-                debug!("File already notified: {}", file.name);
+            if handled_urls.contains(&file.url) {
+                debug!("File already handled: {}", file.name);
                 continue;
             }
 
             let mut downloaded = false;
-            let mut file_path = None;
+            let mut downloaded_outcome = None;
 
             if policy.auto_download {
                 match self
                     .downloader
-                    .download_subtitle(&entry.name, &file.name, &file.url)
+                    .download_subtitle_with_outcome(&entry.name, &file.name, &file.url)
                     .await
                 {
-                    Ok(path) => {
+                    Ok(outcome) => {
                         downloaded = true;
-                        file_path = Some(path);
+                        downloaded_outcome = Some(outcome);
                     }
                     Err(e) => {
                         warn!("Failed to download {}: {}", file.name, e);
@@ -272,7 +384,7 @@ impl Scheduler {
                 }
             }
 
-            // 先占位（notified=0），发送成功才确认，失败留下轮重试
+            // 先占位（notified=0），发送成功才确认，失败留下轮 retry_pending_notifications 重试
             let file_id = self
                 .db
                 .upsert_pending_file(
@@ -292,7 +404,7 @@ impl Scheduler {
                 continue;
             }
 
-            match self
+            let send_res = self
                 .notifier
                 .notify_new_subtitle(&NewSubtitle {
                     file_id,
@@ -306,40 +418,156 @@ impl Scheduler {
                     entry_id: entry.id,
                     downloaded,
                 })
-                .await
-            {
+                .await;
+
+            match send_res {
                 Ok(_) => {
                     self.db.mark_notified(file_id).await?;
-
                     if policy.send_file {
-                        self.send_subtitle_file(entry, &file, file_path).await;
+                        self.send_subtitle_file(
+                            file_id,
+                            &entry.name,
+                            &file.name,
+                            &file.url,
+                            file.size,
+                            policy.auto_download,
+                            downloaded_outcome.map(|o| (o.path, o.size)),
+                        )
+                        .await;
                     }
                 }
-                Err(e) => {
-                    let attempts = self
-                        .db
-                        .mark_notify_failed(file_id, MAX_NOTIFY_ATTEMPTS)
-                        .await?;
-                    error!(
-                        "Failed to send notification for {} (attempt {}/{}): {}",
-                        file.name, attempts, MAX_NOTIFY_ATTEMPTS, e
+                Err(e) if send_maybe_delivered(&e) => {
+                    warn!(
+                        "Notification for {} timed out after reaching Telegram, treating as delivered: {}",
+                        file.name, e
                     );
-                    if attempts >= MAX_NOTIFY_ATTEMPTS {
-                        let _ = self
-                            .notifier
-                            .send_message(format!(
-                                "⚠️ 字幕通知重试 {} 次仍失败，已放弃: <code>{}</code>",
-                                attempts, file.name
-                            ))
-                            .await;
-                    }
+                    self.db.mark_notified(file_id).await?;
+                }
+                Err(e) => {
+                    self.record_notify_failure(file_id, &file.name, &e).await?;
                 }
             }
 
-            // 通知间隔，避免触发 Telegram 限流
-            tokio::time::sleep(NOTIFY_INTERVAL).await;
+            if !cancellable_sleep(NOTIFY_INTERVAL, cancel).await {
+                return Ok(());
+            }
         }
 
+        Ok(())
+    }
+
+    /// 独立重试上轮遗留的私聊通知占位行（notified=0），不依赖 entry 再次出现在 feed
+    async fn retry_pending_notifications(
+        &self,
+        dynamic_subs: &[Subscription],
+        cancel: &CancellationToken,
+    ) -> Result<()> {
+        let pending = self.db.list_pending_notifications().await?;
+        if pending.is_empty() {
+            return Ok(());
+        }
+        info!("Retrying {} pending subtitle notifications", pending.len());
+
+        let mut entry_cache: HashMap<i64, Option<Entry>> = HashMap::new();
+
+        for item in pending {
+            if cancel.is_cancelled() {
+                return Ok(());
+            }
+
+            let entry = match entry_cache.get(&item.entry_id) {
+                Some(cached) => cached.as_ref(),
+                None => {
+                    let fetched = self.jimaku.get_entry_by_id(item.entry_id).await.ok();
+                    entry_cache.insert(item.entry_id, fetched);
+                    entry_cache[&item.entry_id].as_ref()
+                }
+            };
+
+            let policy = entry.and_then(|e| self.resolve_entry_policy(e, dynamic_subs));
+            // 如果在此期间用户已退订或将订阅设为静音，直接结案不再推送
+            if policy.as_ref().is_some_and(|p| !p.notify) {
+                self.db.mark_notified(item.id).await?;
+                continue;
+            }
+
+            let res = self
+                .notifier
+                .notify_new_subtitle(&NewSubtitle {
+                    file_id: item.id,
+                    entry_name: &item.entry_name,
+                    english_name: entry.and_then(|e| e.english_name.as_deref()),
+                    japanese_name: entry.and_then(|e| e.japanese_name.as_deref()),
+                    file_name: &item.file_name,
+                    file_size: item.file_size.unwrap_or(0),
+                    file_url: &item.file_url,
+                    file_modified: Utc::now(),
+                    entry_id: item.entry_id,
+                    downloaded: item.downloaded,
+                })
+                .await;
+
+            match res {
+                Ok(_) => {
+                    self.db.mark_notified(item.id).await?;
+                    info!("Notification retry succeeded: {}", item.file_name);
+                    if let Some(p) = policy.filter(|p| p.send_file) {
+                        self.send_subtitle_file(
+                            item.id,
+                            &item.entry_name,
+                            &item.file_name,
+                            &item.file_url,
+                            item.file_size.unwrap_or(0),
+                            p.auto_download,
+                            None,
+                        )
+                        .await;
+                    }
+                }
+                Err(e) if send_maybe_delivered(&e) => {
+                    warn!(
+                        "Retry notification for {} timed out after reaching Telegram, treating as delivered: {}",
+                        item.file_name, e
+                    );
+                    self.db.mark_notified(item.id).await?;
+                }
+                Err(e) => {
+                    self.record_notify_failure(item.id, &item.file_name, &e)
+                        .await?;
+                }
+            }
+
+            if !cancellable_sleep(NOTIFY_INTERVAL, cancel).await {
+                return Ok(());
+            }
+        }
+        Ok(())
+    }
+
+    async fn record_notify_failure(
+        &self,
+        file_id: i64,
+        file_name: &str,
+        err: &anyhow::Error,
+    ) -> Result<()> {
+        let attempts = self
+            .db
+            .mark_notify_failed(file_id, MAX_NOTIFY_ATTEMPTS)
+            .await?;
+        error!(
+            "Failed to send notification for {} (attempt {}/{}): {}",
+            file_name, attempts, MAX_NOTIFY_ATTEMPTS, err
+        );
+        if attempts >= MAX_NOTIFY_ATTEMPTS {
+            let _ = self
+                .notifier
+                .send_message(format!(
+                    "⚠️ 字幕通知重试 {} 次仍失败，已放弃: <code>{}</code>",
+                    attempts,
+                    html_escape(file_name)
+                ))
+                .await;
+        }
         Ok(())
     }
 
@@ -351,12 +579,24 @@ impl Scheduler {
         entry: &Entry,
         files: &[FileEntry],
         baseline: DateTime<Utc>,
+        persist_to_disk: bool,
+        cancel: &CancellationToken,
     ) {
-        // 分流：已知/死信跳过，基线前的静默标记，其余为待推送新文件
+        let handled_urls = match self.db.get_handled_channel_urls(entry.id).await {
+            Ok(urls) => urls,
+            Err(e) => {
+                warn!(
+                    "Failed to load handled channel URLs for entry {}: {}",
+                    entry.id, e
+                );
+                return;
+            }
+        };
+
         let mut new_files = Vec::new();
         for file in files {
             match channel_file_action(
-                self.db.is_channel_pushed(&file.url).await.unwrap_or(true),
+                handled_urls.contains(&file.url),
                 file.last_modified,
                 baseline,
             ) {
@@ -386,6 +626,10 @@ impl Scheduler {
         let channel = self.channel.as_ref().expect("channel notifier missing");
 
         for file in new_files {
+            if cancel.is_cancelled() {
+                return;
+            }
+
             let row_id = match self
                 .db
                 .upsert_channel_pending(
@@ -413,86 +657,43 @@ impl Scheduler {
                 anilist_id: entry.anilist_id,
                 file_modified: file.last_modified,
             };
-            let result = if file.size > MAX_DOCUMENT_SIZE {
-                channel.send_text_card(&channel_link_card(&sub)).await
-            } else {
-                match self
-                    .downloader
-                    .download_subtitle(&entry.name, &file.name, &file.url)
-                    .await
-                {
-                    Ok(path) => {
-                        channel
-                            .send_subtitle_document(&path, &channel_caption(&sub))
-                            .await
-                    }
-                    Err(e) => Err(e),
-                }
-            };
 
-            match result {
-                Ok(_) => {
-                    if let Err(e) = self.db.mark_channel_pushed(row_id).await {
-                        warn!("Failed to mark channel pushed {}: {}", file.name, e);
-                    }
-                    info!("Channel pushed: {}", file.name);
-                }
-                Err(e) if send_maybe_delivered(&e) => {
-                    // 请求已发出但响应超时：Telegram 很可能已收到，按已送达处理避免重试重复
-                    warn!(
-                        "Send of {} timed out after reaching Telegram, treating as delivered: {}",
-                        file.name, e
-                    );
-                    if let Err(e) = self.db.mark_channel_pushed(row_id).await {
-                        warn!("Failed to mark channel pushed {}: {}", file.name, e);
-                    }
-                }
-                Err(e) => {
-                    match self
-                        .db
-                        .mark_channel_failed(row_id, MAX_CHANNEL_ATTEMPTS)
-                        .await
-                    {
-                        Ok(attempts) => {
-                            error!(
-                                "Failed to push {} to channel (attempt {}/{}): {}",
-                                file.name, attempts, MAX_CHANNEL_ATTEMPTS, e
-                            );
-                            if attempts >= MAX_CHANNEL_ATTEMPTS {
-                                let _ = self
-                                    .notifier
-                                    .send_message(format!(
-                                        "⚠️ 频道推送重试 {} 次仍失败，已放弃: <code>{}</code>",
-                                        attempts, file.name
-                                    ))
-                                    .await;
-                            }
-                        }
-                        Err(db_err) => {
-                            error!("Failed to record channel failure {}: {}", file.name, db_err)
-                        }
-                    }
-                }
+            let result = self
+                .deliver_to_channel(
+                    channel,
+                    &entry.name,
+                    &file.name,
+                    &file.url,
+                    file.size,
+                    persist_to_disk,
+                    &sub,
+                )
+                .await;
+
+            self.handle_channel_result(row_id, &file.name, result).await;
+
+            if !cancellable_sleep(CHANNEL_SEND_INTERVAL, cancel).await {
+                return;
             }
-
-            tokio::time::sleep(CHANNEL_SEND_INTERVAL).await;
         }
     }
 
     /// 独立重试上轮遗留的频道推送占位行（不依赖 entry 再次出现在 feed）
-    async fn retry_channel_pending(&self) -> Result<()> {
+    async fn retry_channel_pending(&self, cancel: &CancellationToken) -> Result<()> {
         let pending = self.db.list_channel_pending().await?;
         if pending.is_empty() {
             return Ok(());
         }
         info!("Retrying {} pending channel files", pending.len());
 
-        // 按 entry 分组取作品名，避免重复请求 jimaku
-        let mut entry_cache: std::collections::HashMap<i64, Option<Entry>> =
-            std::collections::HashMap::new();
+        let mut entry_cache: HashMap<i64, Option<Entry>> = HashMap::new();
         let channel = self.channel.as_ref().expect("channel notifier missing");
 
         for file in pending {
+            if cancel.is_cancelled() {
+                return Ok(());
+            }
+
             let entry = match entry_cache.get(&file.entry_id) {
                 Some(cached) => cached.as_ref(),
                 None => {
@@ -502,121 +703,276 @@ impl Scheduler {
                 }
             };
 
-            let ja = entry.and_then(|e| e.japanese_name.clone());
+            let ja = entry.and_then(|e| e.japanese_name.as_deref());
+            let size = file.file_size.unwrap_or(0);
 
             let sub = ChannelSubtitle {
-                japanese_name: ja.as_deref(),
+                japanese_name: ja,
                 file_name: &file.file_name,
-                file_size: file.file_size.unwrap_or(0),
+                file_size: size,
                 entry_id: file.entry_id,
                 file_url: &file.file_url,
                 anilist_id: entry.and_then(|e| e.anilist_id),
-                // 占位行未存文件时间，重试用当前时间近似
                 file_modified: Utc::now(),
             };
-            let result = if file.file_size.unwrap_or(0) > MAX_DOCUMENT_SIZE {
-                channel.send_text_card(&channel_link_card(&sub)).await
-            } else {
-                match self
-                    .downloader
-                    .download_subtitle(&file.entry_name, &file.file_name, &file.file_url)
-                    .await
-                {
-                    Ok(path) => {
-                        channel
-                            .send_subtitle_document(&path, &channel_caption(&sub))
-                            .await
-                    }
-                    Err(e) => Err(e),
-                }
-            };
 
-            match result {
-                Ok(_) => {
-                    self.db.mark_channel_pushed(file.id).await?;
-                    info!("Channel retry succeeded: {}", file.file_name);
+            let result = self
+                .deliver_to_channel(
+                    channel,
+                    &file.entry_name,
+                    &file.file_name,
+                    &file.file_url,
+                    size,
+                    self.config.download.enabled,
+                    &sub,
+                )
+                .await;
+
+            self.handle_channel_result(file.id, &file.file_name, result)
+                .await;
+            self.write_heartbeat().await;
+
+            if !cancellable_sleep(CHANNEL_SEND_INTERVAL, cancel).await {
+                return Ok(());
+            }
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn deliver_to_channel(
+        &self,
+        channel: &ChannelNotifier,
+        entry_name: &str,
+        file_name: &str,
+        file_url: &str,
+        declared_size: i64,
+        persist_to_disk: bool,
+        sub: &ChannelSubtitle<'_>,
+    ) -> Result<()> {
+        if declared_size > 0 && (declared_size as u64) > MAX_DOCUMENT_SIZE {
+            return channel.send_text_card(&channel_link_card(sub)).await;
+        }
+
+        // 若本地已有文件（如订阅已触发下载），直接复用
+        let local = self.downloader.local_path(entry_name, file_name);
+        if let Ok(meta) = tokio::fs::metadata(&local).await {
+            if meta.len() > 0 {
+                if meta.len() > MAX_DOCUMENT_SIZE {
+                    return channel.send_text_card(&channel_link_card(sub)).await;
                 }
-                Err(e) if send_maybe_delivered(&e) => {
-                    warn!(
-                        "Retry send of {} timed out after reaching Telegram, treating as delivered: {}",
-                        file.file_name, e
-                    );
-                    self.db.mark_channel_pushed(file.id).await?;
+                return channel
+                    .send_subtitle_document(DocumentSource::Path(&local), &channel_caption(sub))
+                    .await;
+            }
+        }
+
+        if persist_to_disk {
+            let outcome = self
+                .downloader
+                .download_subtitle_with_outcome(entry_name, file_name, file_url)
+                .await?;
+            if outcome.size > MAX_DOCUMENT_SIZE {
+                return channel.send_text_card(&channel_link_card(sub)).await;
+            }
+            channel
+                .send_subtitle_document(DocumentSource::Path(&outcome.path), &channel_caption(sub))
+                .await
+        } else {
+            match self
+                .downloader
+                .fetch_subtitle_bytes(file_url, MAX_DOCUMENT_SIZE as usize)
+                .await?
+            {
+                FetchedSubtitle::TooLarge => channel.send_text_card(&channel_link_card(sub)).await,
+                FetchedSubtitle::Bytes(data) => {
+                    channel
+                        .send_subtitle_document(
+                            DocumentSource::Memory { file_name, data },
+                            &channel_caption(sub),
+                        )
+                        .await
                 }
-                Err(e) => {
-                    let attempts = self
-                        .db
-                        .mark_channel_failed(file.id, MAX_CHANNEL_ATTEMPTS)
-                        .await?;
+            }
+        }
+    }
+
+    async fn handle_channel_result(&self, row_id: i64, file_name: &str, result: Result<()>) {
+        match result {
+            Ok(_) => {
+                if let Err(e) = self.db.mark_channel_pushed(row_id).await {
+                    warn!("Failed to mark channel pushed {}: {}", file_name, e);
+                }
+                info!("Channel pushed: {}", file_name);
+            }
+            Err(e) if send_maybe_delivered(&e) => {
+                warn!(
+                    "Send of {} timed out after reaching Telegram, treating as delivered: {}",
+                    file_name, e
+                );
+                if let Err(e) = self.db.mark_channel_pushed(row_id).await {
+                    warn!("Failed to mark channel pushed {}: {}", file_name, e);
+                }
+            }
+            Err(e) => match self
+                .db
+                .mark_channel_failed(row_id, MAX_CHANNEL_ATTEMPTS)
+                .await
+            {
+                Ok(attempts) => {
                     error!(
-                        "Channel retry failed for {} (attempt {}/{}): {}",
-                        file.file_name, attempts, MAX_CHANNEL_ATTEMPTS, e
+                        "Failed to push {} to channel (attempt {}/{}): {}",
+                        file_name, attempts, MAX_CHANNEL_ATTEMPTS, e
                     );
                     if attempts >= MAX_CHANNEL_ATTEMPTS {
                         let _ = self
                             .notifier
                             .send_message(format!(
                                 "⚠️ 频道推送重试 {} 次仍失败，已放弃: <code>{}</code>",
-                                attempts, file.file_name
+                                attempts,
+                                html_escape(file_name)
                             ))
                             .await;
                     }
                 }
-            }
-
-            tokio::time::sleep(CHANNEL_SEND_INTERVAL).await;
+                Err(db_err) => {
+                    error!("Failed to record channel failure {}: {}", file_name, db_err);
+                }
+            },
         }
-        Ok(())
     }
 
     /// 通知后把字幕文件作为文档发送到聊天（订阅开启 send_file 时）
+    #[allow(clippy::too_many_arguments)]
     async fn send_subtitle_file(
         &self,
-        entry: &Entry,
-        file: &crate::jimaku::FileEntry,
-        downloaded_path: Option<std::path::PathBuf>,
+        file_id: i64,
+        entry_name: &str,
+        file_name: &str,
+        file_url: &str,
+        declared_size: i64,
+        persist_to_disk: bool,
+        downloaded_file: Option<(std::path::PathBuf, u64)>,
     ) {
-        let path = match downloaded_path {
-            Some(path) => Some(path),
-            None => match self
-                .downloader
-                .download_subtitle(&entry.name, &file.name, &file.url)
-                .await
-            {
-                Ok(path) => {
-                    let _ = self
-                        .db
-                        .record_file(
-                            entry.id,
-                            &entry.name,
-                            &file.name,
-                            &file.url,
-                            Some(file.size),
-                            true,
-                        )
-                        .await;
-                    Some(path)
-                }
-                Err(e) => {
-                    warn!("Failed to download {} for sending: {}", file.name, e);
-                    None
-                }
-            },
-        };
-
-        let Some(path) = path else {
+        if declared_size > 0 && (declared_size as u64) > MAX_DOCUMENT_SIZE {
             let _ = self
                 .notifier
                 .send_message(format!(
-                    "⚠️ 字幕文件下载失败，无法发送: <code>{}</code>",
-                    file.name
+                    "⚠️ 字幕文件超过 Telegram 发送上限 (48MB)，请从网页下载: <code>{}</code>",
+                    html_escape(file_name)
                 ))
                 .await;
             return;
-        };
+        }
 
-        if let Err(e) = self.notifier.send_document(&path).await {
-            error!("Failed to send subtitle file {}: {}", file.name, e);
+        if let Some((path, size)) = downloaded_file {
+            if size > MAX_DOCUMENT_SIZE {
+                let _ = self
+                    .notifier
+                    .send_message(format!(
+                        "⚠️ 字幕文件超过 Telegram 发送上限 (48MB): <code>{}</code>",
+                        html_escape(file_name)
+                    ))
+                    .await;
+                return;
+            }
+            if let Err(e) = self
+                .notifier
+                .send_document(DocumentSource::Path(&path))
+                .await
+            {
+                error!("Failed to send subtitle file {}: {}", file_name, e);
+            }
+            return;
+        }
+
+        // 检查本地是否已存在
+        let local = self.downloader.local_path(entry_name, file_name);
+        if let Ok(meta) = tokio::fs::metadata(&local).await {
+            if meta.len() > 0 && meta.len() <= MAX_DOCUMENT_SIZE {
+                if let Err(e) = self
+                    .notifier
+                    .send_document(DocumentSource::Path(&local))
+                    .await
+                {
+                    error!("Failed to send subtitle file {}: {}", file_name, e);
+                }
+                return;
+            }
+        }
+
+        if persist_to_disk {
+            match self
+                .downloader
+                .download_subtitle_with_outcome(entry_name, file_name, file_url)
+                .await
+            {
+                Ok(outcome) => {
+                    let _ = self.db.mark_file_downloaded(file_id).await;
+                    if outcome.size > MAX_DOCUMENT_SIZE {
+                        let _ = self
+                            .notifier
+                            .send_message(format!(
+                                "⚠️ 字幕文件已下载到本地，但超过 Telegram 发送上限 (48MB): <code>{}</code>",
+                                html_escape(file_name)
+                            ))
+                            .await;
+                        return;
+                    }
+                    if let Err(e) = self
+                        .notifier
+                        .send_document(DocumentSource::Path(&outcome.path))
+                        .await
+                    {
+                        error!("Failed to send subtitle file {}: {}", file_name, e);
+                    }
+                }
+                Err(e) => {
+                    warn!("Failed to download {} for sending: {}", file_name, e);
+                    let _ = self
+                        .notifier
+                        .send_message(format!(
+                            "⚠️ 字幕文件下载失败，无法发送: <code>{}</code>",
+                            html_escape(file_name)
+                        ))
+                        .await;
+                }
+            }
+        } else {
+            match self
+                .downloader
+                .fetch_subtitle_bytes(file_url, MAX_DOCUMENT_SIZE as usize)
+                .await
+            {
+                Ok(FetchedSubtitle::Bytes(data)) => {
+                    if let Err(e) = self
+                        .notifier
+                        .send_document(DocumentSource::Memory { file_name, data })
+                        .await
+                    {
+                        error!("Failed to send subtitle file {}: {}", file_name, e);
+                    }
+                }
+                Ok(FetchedSubtitle::TooLarge) => {
+                    let _ = self
+                        .notifier
+                        .send_message(format!(
+                            "⚠️ 字幕文件超过 Telegram 发送上限 (48MB)，请从网页下载: <code>{}</code>",
+                            html_escape(file_name)
+                        ))
+                        .await;
+                }
+                Err(e) => {
+                    warn!("Failed to fetch {} for sending: {}", file_name, e);
+                    let _ = self
+                        .notifier
+                        .send_message(format!(
+                            "⚠️ 字幕文件下载失败，无法发送: <code>{}</code>",
+                            html_escape(file_name)
+                        ))
+                        .await;
+                }
+            }
         }
     }
 }
@@ -629,7 +985,15 @@ const MAX_CHANNEL_ATTEMPTS: i64 = 5;
 /// 频道消息限制比私聊严（约 20 条/分钟），发送间隔取 1s
 const CHANNEL_SEND_INTERVAL: Duration = Duration::from_secs(1);
 /// Telegram bot 本地上传上限 50MB，jimaku 自报 size 可能有出入，取保守值
-const MAX_DOCUMENT_SIZE: i64 = 48 * 1024 * 1024;
+pub const MAX_DOCUMENT_SIZE: u64 = 48 * 1024 * 1024;
+
+/// 可响应停机信号的异步 sleep：正常睡完返回 `true`，收到取消信号返回 `false`
+async fn cancellable_sleep(duration: Duration, cancel: &CancellationToken) -> bool {
+    tokio::select! {
+        _ = tokio::time::sleep(duration) => true,
+        _ = cancel.cancelled() => false,
+    }
+}
 
 /// 频道推送对单个文件的处理动作
 #[derive(Debug, PartialEq, Eq)]
@@ -678,7 +1042,6 @@ fn file_matches_keywords(file_name: &str, keywords: &[String]) -> bool {
         .map(|keyword| keyword.trim().to_lowercase())
         .any(|keyword| !keyword.is_empty() && file_name.contains(&keyword))
 }
-
 #[cfg(test)]
 mod tests {
     use super::{channel_file_action, file_matches_keywords, ChannelAction};

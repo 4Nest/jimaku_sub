@@ -8,8 +8,7 @@ use tracing::{error, warn};
 use crate::bot::keyboards::{entry_selection_keyboard, subscription_panel};
 use crate::bot::text::{display_entry_title, format_subscriptions, html_escape, subscription_card};
 use crate::bot::AppState;
-use crate::downloader::Downloader;
-
+use crate::database::Subscription;
 /// /sub 多结果选择的短 token（callback_data 有 64 字节上限）
 pub fn new_search_token() -> String {
     uuid::Uuid::new_v4().simple().to_string()[..8].to_string()
@@ -73,11 +72,21 @@ pub async fn answer(bot: Bot, msg: Message, cmd: Command, state: AppState) -> Re
             }
         },
         Command::Checknow => {
+            if state.scheduler.is_checking() {
+                bot.send_message(chat_id, "⏳ 当前已有检查任务正在运行，请稍候")
+                    .await?;
+                return Ok(());
+            }
+
             bot.send_message(chat_id, "🔍 正在触发检查...").await?;
 
-            match state.scheduler.check_once().await {
-                Ok(_) => {
+            match state.scheduler.try_check_now(&state.cancel).await {
+                Ok(true) => {
                     bot.send_message(chat_id, "✅ 检查完成").await?;
+                }
+                Ok(false) => {
+                    bot.send_message(chat_id, "⏳ 当前已有检查任务正在运行，请稍候")
+                        .await?;
                 }
                 Err(e) => {
                     bot.send_message(chat_id, format!("❌ 检查失败: {}", e))
@@ -94,7 +103,10 @@ pub async fn answer(bot: Bot, msg: Message, cmd: Command, state: AppState) -> Re
             }
             Ok(subs) => {
                 const MAX_PANELS: usize = 20;
-                for sub in subs.iter().take(MAX_PANELS) {
+                for (idx, sub) in subs.iter().take(MAX_PANELS).enumerate() {
+                    if idx > 0 {
+                        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+                    }
                     bot.send_message(chat_id, subscription_card(sub))
                         .parse_mode(ParseMode::Html)
                         .reply_markup(subscription_panel(sub))
@@ -199,27 +211,28 @@ async fn handle_download(
         return Ok(());
     }
 
-    let downloader = Downloader::new(&state.config.download.download_path);
+    let downloaded_urls = match state.db.get_downloaded_urls(entry_id).await {
+        Ok(urls) => urls,
+        Err(e) => {
+            bot.send_message(chat_id, format!("❌ 查询下载记录失败: {}", e))
+                .await?;
+            return Ok(());
+        }
+    };
+
     let mut downloaded = 0;
     let mut skipped = 0;
     let mut failed = 0;
     let mut failures = Vec::new();
 
     for file in files {
-        match state.db.is_file_downloaded(&file.url).await {
-            Ok(true) => {
-                skipped += 1;
-                continue;
-            }
-            Ok(false) => {}
-            Err(e) => {
-                failed += 1;
-                failures.push(format!("{}: {}", file.name, e));
-                continue;
-            }
+        if downloaded_urls.contains(&file.url) {
+            skipped += 1;
+            continue;
         }
 
-        match downloader
+        match state
+            .downloader
             .download_subtitle_with_outcome(&entry.name, &file.name, &file.url)
             .await
         {
@@ -416,33 +429,64 @@ async fn handle_unsubscribe(
         return Ok(());
     }
 
-    let removed = if let Ok(entry_id) = query.parse::<i64>() {
-        state.db.remove_subscription(entry_id).await
-    } else {
-        match state.db.remove_subscription_by_name(query).await {
-            Ok(true) => Ok(true),
-            Ok(false) => match state.jimaku.search_entries_by_query(query).await {
-                Ok(entries) if entries.is_empty() => Ok(false),
-                Ok(entries) => state.db.remove_subscription(entries[0].id).await,
-                Err(e) => {
-                    error!("Failed to resolve unsubscribe query {}: {}", query, e);
-                    Ok(false)
-                }
-            },
-            Err(e) => Err(e),
+    // 1) 按数字 entry_id 精确退订
+    if let Ok(entry_id) = query.parse::<i64>() {
+        let existing = state.db.get_subscription(entry_id).await.ok().flatten();
+        match state.db.remove_subscription(entry_id).await {
+            Ok(true) => {
+                let label = existing
+                    .and_then(|s| s.title)
+                    .map(|t| format!("<b>{}</b> (<code>{}</code>)", html_escape(&t), entry_id))
+                    .unwrap_or_else(|| format!("<code>{}</code>", entry_id));
+                bot.send_message(chat_id, format!("✅ 已取消订阅: {}", label))
+                    .parse_mode(ParseMode::Html)
+                    .await?;
+            }
+            Ok(false) => {
+                bot.send_message(chat_id, format!("ℹ️ 没找到订阅: <code>{}</code>", entry_id))
+                    .parse_mode(ParseMode::Html)
+                    .await?;
+            }
+            Err(e) => {
+                bot.send_message(chat_id, format!("❌ 取消订阅失败: {}", e))
+                    .await?;
+            }
+        }
+        return Ok(());
+    }
+
+    // 2) 按标题在本地已订阅列表中匹配（精确优先，其次唯一子串匹配，多命中时列出防误删）
+    let subs = match state.db.list_subscriptions().await {
+        Ok(subs) => subs,
+        Err(e) => {
+            bot.send_message(chat_id, format!("❌ 查询订阅失败: {}", e))
+                .await?;
+            return Ok(());
         }
     };
 
-    match removed {
-        Ok(true) => {
-            bot.send_message(
-                chat_id,
-                format!("✅ 已取消订阅: <code>{}</code>", html_escape(query)),
-            )
-            .parse_mode(ParseMode::Html)
-            .await?;
+    let mut matched = match_local_subscriptions(&subs, query);
+
+    // 3) 本地未命中时（如用日文原名搜英文标题订阅），搜索 Jimaku 并与本地已订阅集合求交集
+    if matched.is_empty() && !subs.is_empty() {
+        match state.jimaku.search_entries_by_query(query).await {
+            Ok(entries) => {
+                let found_ids: std::collections::HashSet<i64> =
+                    entries.into_iter().map(|e| e.id).collect();
+                matched = subs
+                    .iter()
+                    .filter(|s| found_ids.contains(&s.entry_id))
+                    .cloned()
+                    .collect();
+            }
+            Err(e) => {
+                error!("Failed to resolve unsubscribe query {}: {}", query, e);
+            }
         }
-        Ok(false) => {
+    }
+
+    match matched.len() {
+        0 => {
             bot.send_message(
                 chat_id,
                 format!("ℹ️ 没找到订阅: <code>{}</code>", html_escape(query)),
@@ -450,13 +494,87 @@ async fn handle_unsubscribe(
             .parse_mode(ParseMode::Html)
             .await?;
         }
-        Err(e) => {
-            bot.send_message(chat_id, format!("❌ 取消订阅失败: {}", e))
-                .await?;
+        1 => {
+            let target = &matched[0];
+            match state.db.remove_subscription(target.entry_id).await {
+                Ok(true) => {
+                    let title = target.title.as_deref().unwrap_or(query);
+                    bot.send_message(
+                        chat_id,
+                        format!(
+                            "✅ 已取消订阅: <b>{}</b> (<code>{}</code>)",
+                            html_escape(title),
+                            target.entry_id
+                        ),
+                    )
+                    .parse_mode(ParseMode::Html)
+                    .await?;
+                }
+                Ok(false) => {
+                    bot.send_message(
+                        chat_id,
+                        format!("ℹ️ 没找到订阅: <code>{}</code>", html_escape(query)),
+                    )
+                    .parse_mode(ParseMode::Html)
+                    .await?;
+                }
+                Err(e) => {
+                    bot.send_message(chat_id, format!("❌ 取消订阅失败: {}", e))
+                        .await?;
+                }
+            }
+        }
+        _ => {
+            let list = matched
+                .iter()
+                .map(|s| {
+                    format!(
+                        "  • {} → <code>/unsub {}</code>",
+                        html_escape(s.title.as_deref().unwrap_or("未命名订阅")),
+                        s.entry_id
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            bot.send_message(
+                chat_id,
+                format!("⚠️ 匹配到多个已订阅作品，请用 Entry ID 精确退订:\n{}", list),
+            )
+            .parse_mode(ParseMode::Html)
+            .await?;
         }
     }
 
     Ok(())
+}
+
+fn match_local_subscriptions(subs: &[Subscription], query: &str) -> Vec<Subscription> {
+    let q = query.trim().to_lowercase();
+    if q.is_empty() {
+        return Vec::new();
+    }
+
+    let exact: Vec<Subscription> = subs
+        .iter()
+        .filter(|s| {
+            s.title
+                .as_deref()
+                .is_some_and(|t| t.trim().to_lowercase() == q)
+        })
+        .cloned()
+        .collect();
+    if !exact.is_empty() {
+        return exact;
+    }
+
+    subs.iter()
+        .filter(|s| {
+            s.title
+                .as_deref()
+                .is_some_and(|t| t.to_lowercase().contains(&q))
+        })
+        .cloned()
+        .collect()
 }
 
 struct ParsedSubArgs {
@@ -516,8 +634,9 @@ fn parse_release_keywords(rule: &str) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_sub_args;
-
+    use super::{match_local_subscriptions, parse_sub_args};
+    use crate::database::Subscription;
+    use chrono::Utc;
     #[test]
     fn parses_entry_subscription() {
         let parsed = parse_sub_args("11824").unwrap();
@@ -538,5 +657,28 @@ mod tests {
         let parsed = parse_sub_args("entry 11824").unwrap();
         assert_eq!(parsed.query, "entry 11824");
         assert_eq!(parsed.entry_id, None);
+    }
+
+    #[test]
+    fn local_unsub_matching_prefers_exact_and_flags_ambiguous_partials() {
+        let mk = |id: i64, title: &str| Subscription {
+            entry_id: id,
+            title: Some(title.to_string()),
+            keywords: vec![],
+            created_at: Utc::now(),
+            muted: false,
+            auto_download: None,
+            send_file: false,
+        };
+        let subs = vec![mk(1, "Slime"), mk(2, "Slime Season 2")];
+        // 精确命中第 1 部，不会把第 2 部也算作歧义
+        let exact = match_local_subscriptions(&subs, "slime");
+        assert_eq!(exact.len(), 1);
+        assert_eq!(exact[0].entry_id, 1);
+
+        // 仅子串命中多部时全部返回，由上层提示精确 ID 防误删
+        let subs2 = vec![mk(1, "Slime Season 1"), mk(2, "Slime Season 2")];
+        let partial = match_local_subscriptions(&subs2, "slime");
+        assert_eq!(partial.len(), 2);
     }
 }

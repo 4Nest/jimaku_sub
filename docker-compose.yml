@@ -8,18 +8,18 @@ services:
     stop_grace_period: 30s
     environment:
       - RUST_LOG=${RUST_LOG:-info,teloxide=warn}
-      - LOG_DIR=/app/logs
-      - LOG_RETENTION_DAYS=${LOG_RETENTION_DAYS:-30}
-      - DATABASE_URL=sqlite:///app/data/jimaku_subscriber.db
-      # 必需配置
-      - JIMAKU_API_KEY=${JIMAKU_API_KEY}
-      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
-      - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
-      # 可选配置
-      - DOWNLOAD_ENABLED=${DOWNLOAD_ENABLED:-false}
-      - DOWNLOAD_PATH=${DOWNLOAD_PATH:-/app/downloads}
+      - LOG_DIR=${LOG_DIR:-/app/logs}
+      - LOG_RETENTION_DAYS=${LOG_RETENTION_DAYS:-}
+      - DATABASE_URL=${DATABASE_URL:-sqlite:///app/data/jimaku_subscriber.db}
+      # 必需配置（未挂载 config.toml 时在 .env 中填写）
+      - JIMAKU_API_KEY=${JIMAKU_API_KEY:-}
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
+      - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID:-}
+      # 可选配置（留空时不覆盖挂载的 config.toml）
+      - DOWNLOAD_ENABLED=${DOWNLOAD_ENABLED:-}
+      - DOWNLOAD_PATH=${DOWNLOAD_PATH:-}
       # 全量字幕频道推送（bot 需加为频道管理员）
-      - CHANNEL_ENABLED=${CHANNEL_ENABLED:-false}
+      - CHANNEL_ENABLED=${CHANNEL_ENABLED:-}
       - CHANNEL_CHAT_ID=${CHANNEL_CHAT_ID:-}
       #- SCHEDULER_INTERVAL_SECONDS=300
       #- SUBSCRIPTION_ANILIST_IDS=16498,1535
@@ -29,8 +29,8 @@ services:
       - ./downloads:/app/downloads
       - ./logs:/app/logs
     healthcheck:
-      # 心跳文件由调度器每轮成功检查后刷新；15 分钟内无心跳视为异常
-      test: ["CMD-SHELL", "test -f /tmp/jimaku_heartbeat && test $$(( $$(date +%s) - $$(stat -c %Y /tmp/jimaku_heartbeat) )) -lt 900"]
+      # 心跳文件在启动与每轮检查/推送期间刷新；默认 30 分钟内无心跳视为异常
+      test: ["CMD-SHELL", "test -f /tmp/jimaku_heartbeat && test $$(( $$(date +%s) - $$(stat -c %Y /tmp/jimaku_heartbeat) )) -lt ${HEALTHCHECK_MAX_AGE:-1800}"]
       interval: 60s
       timeout: 10s
       retries: 3

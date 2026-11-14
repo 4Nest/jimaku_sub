@@ -1,24 +1,32 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use sqlx::{sqlite::SqliteConnectOptions, SqlitePool};
-use std::str::FromStr;
+use std::{collections::HashSet, str::FromStr, time::Duration};
 use tracing::{debug, info};
 
 pub struct Database {
     pool: SqlitePool,
 }
 
-#[derive(Debug, Clone, sqlx::FromRow)]
-#[allow(dead_code)]
+#[derive(Debug, Clone)]
 pub struct NotifiedFile {
+    pub entry_id: i64,
+    pub entry_name: String,
+    pub file_name: String,
+    pub file_url: String,
+    pub file_size: Option<i64>,
+}
+
+/// 待重试的私聊通知记录（notified = 0）
+#[derive(Debug, Clone)]
+pub struct PendingNotification {
     pub id: i64,
     pub entry_id: i64,
     pub entry_name: String,
     pub file_name: String,
     pub file_url: String,
     pub file_size: Option<i64>,
-    pub notified_at: DateTime<Utc>,
-    pub downloaded: i64,
+    pub downloaded: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -43,16 +51,26 @@ pub struct PendingSearch {
     pub entry_ids: Vec<i64>,
 }
 
+type SubscriptionRow = (
+    i64,
+    Option<String>,
+    Option<String>,
+    String,
+    i64,
+    Option<i64>,
+    i64,
+);
+
 impl Database {
     pub async fn new(database_url: &str) -> Result<Self> {
         let options = SqliteConnectOptions::from_str(database_url)?
             .create_if_missing(true)
-            .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal);
+            .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
+            .busy_timeout(Duration::from_secs(5));
 
         let pool = SqlitePool::connect_with(options)
             .await
             .context("Failed to connect to SQLite database")?;
-
         let db = Self { pool };
         db.migrate().await?;
         Ok(db)
@@ -72,7 +90,7 @@ impl Database {
                 downloaded INTEGER DEFAULT 0
             );
             CREATE INDEX IF NOT EXISTS idx_notified_entry ON notified_files(entry_id);
-            CREATE INDEX IF NOT EXISTS idx_notified_url ON notified_files(file_url);
+            DROP INDEX IF EXISTS idx_notified_url;
             "#,
         )
         .execute(&self.pool)
@@ -159,20 +177,11 @@ impl Database {
         .await
         .context("Failed to create channel_files table")?;
 
-        // AniList 罗马音标题缓存；romaji 为 NULL 表示负缓存（查无此条目）
-        sqlx::query(
-            r#"
-            CREATE TABLE IF NOT EXISTS anilist_titles (
-                anilist_id INTEGER PRIMARY KEY,
-                romaji TEXT,
-                fetched_at TEXT NOT NULL
-            );
-            "#,
-        )
-        .execute(&self.pool)
-        .await
-        .context("Failed to create anilist_titles table")?;
-
+        // 清理早期版本遗留的废弃表
+        sqlx::query("DROP TABLE IF EXISTS anilist_titles;")
+            .execute(&self.pool)
+            .await
+            .context("Failed to drop legacy anilist_titles table")?;
         info!("Database migration completed");
         Ok(())
     }
@@ -218,18 +227,30 @@ impl Database {
         Ok(())
     }
 
-    pub async fn is_file_notified(&self, file_url: &str) -> Result<bool> {
-        let count: (i64,) = sqlx::query_as(
-            "SELECT COUNT(*) FROM notified_files WHERE file_url = ? AND notified = 1",
+    /// 按 entry 一次性读取已处理（已通知或已死信）的文件 URL 集合，避免单条目 N+1 查询
+    pub async fn get_handled_notified_urls(&self, entry_id: i64) -> Result<HashSet<String>> {
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "SELECT file_url FROM notified_files WHERE entry_id = ? AND notified != 0",
         )
-        .bind(file_url)
-        .fetch_one(&self.pool)
+        .bind(entry_id)
+        .fetch_all(&self.pool)
         .await?;
-        Ok(count.0 > 0)
+        Ok(rows.into_iter().map(|(url,)| url).collect())
+    }
+
+    /// 按 entry 一次性读取已下载到本地的文件 URL 集合
+    pub async fn get_downloaded_urls(&self, entry_id: i64) -> Result<HashSet<String>> {
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "SELECT file_url FROM notified_files WHERE entry_id = ? AND downloaded = 1",
+        )
+        .bind(entry_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(|(url,)| url).collect())
     }
 
     /// 插入/更新占位行（notified=0），返回行 id。
-    /// 已死信(-1)的行保持死信状态，不再重试。
+    /// 已通知(1)与已死信(-1)的行保持原状态，防止重入回退。
     pub async fn upsert_pending_file(
         &self,
         entry_id: i64,
@@ -249,7 +270,10 @@ impl Database {
                 file_name = excluded.file_name,
                 file_size = COALESCE(excluded.file_size, notified_files.file_size),
                 downloaded = MAX(notified_files.downloaded, excluded.downloaded),
-                notified = CASE WHEN notified_files.notified = -1 THEN -1 ELSE 0 END
+                notified = CASE
+                    WHEN notified_files.notified IN (1, -1) THEN notified_files.notified
+                    ELSE 0
+                END
              RETURNING id",
         )
         .bind(entry_id)
@@ -262,6 +286,41 @@ impl Database {
         .fetch_one(&self.pool)
         .await?;
         Ok(row.0)
+    }
+
+    /// 列出待重试的私聊通知行（notified=0）
+    pub async fn list_pending_notifications(&self) -> Result<Vec<PendingNotification>> {
+        type Row = (i64, i64, String, String, String, Option<i64>, i64);
+        let rows: Vec<Row> = sqlx::query_as(
+            "SELECT id, entry_id, entry_name, file_name, file_url, file_size, downloaded
+             FROM notified_files WHERE notified = 0 ORDER BY id",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(
+                |(id, entry_id, entry_name, file_name, file_url, file_size, downloaded)| {
+                    PendingNotification {
+                        id,
+                        entry_id,
+                        entry_name,
+                        file_name,
+                        file_url,
+                        file_size,
+                        downloaded: downloaded != 0,
+                    }
+                },
+            )
+            .collect())
+    }
+
+    pub async fn mark_file_downloaded(&self, id: i64) -> Result<()> {
+        sqlx::query("UPDATE notified_files SET downloaded = 1 WHERE id = ?")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
     }
 
     pub async fn mark_notified(&self, id: i64) -> Result<()> {
@@ -288,17 +347,6 @@ impl Database {
         .await?;
         Ok(row.0)
     }
-
-    pub async fn is_file_downloaded(&self, file_url: &str) -> Result<bool> {
-        let count: (i64,) = sqlx::query_as(
-            "SELECT COUNT(*) FROM notified_files WHERE file_url = ? AND downloaded = 1",
-        )
-        .bind(file_url)
-        .fetch_one(&self.pool)
-        .await?;
-        Ok(count.0 > 0)
-    }
-
     pub async fn record_file(
         &self,
         entry_id: i64,
@@ -371,62 +419,27 @@ impl Database {
         Ok(result.rows_affected() > 0)
     }
 
-    pub async fn remove_subscription_by_name(&self, name: &str) -> Result<bool> {
-        let normalized = name.trim().to_lowercase();
-        let result = sqlx::query(
-            "DELETE FROM subscriptions
-             WHERE lower(title) = ?",
-        )
-        .bind(&normalized)
-        .execute(&self.pool)
-        .await?;
-        Ok(result.rows_affected() > 0)
-    }
-
     pub async fn list_subscriptions(&self) -> Result<Vec<Subscription>> {
-        type Row = (
-            i64,
-            Option<String>,
-            Option<String>,
-            String,
-            i64,
-            Option<i64>,
-            i64,
-        );
-        let rows: Vec<Row> = sqlx::query_as(
+        let rows: Vec<SubscriptionRow> = sqlx::query_as(
             "SELECT entry_id, title, keywords, created_at, muted, auto_download, send_file
-                 FROM subscriptions ORDER BY created_at",
+             FROM subscriptions ORDER BY created_at",
         )
         .fetch_all(&self.pool)
         .await?;
 
-        let subs = rows
-            .into_iter()
-            .filter_map(
-                |(entry_id, title, keywords, ts, muted, auto_download, send_file)| {
-                    DateTime::parse_from_rfc3339(&ts)
-                        .ok()
-                        .map(|dt| Subscription {
-                            entry_id,
-                            title,
-                            keywords: parse_keywords(keywords.as_deref()),
-                            created_at: dt.with_timezone(&Utc),
-                            muted: muted != 0,
-                            auto_download: auto_download.map(|v| v != 0),
-                            send_file: send_file != 0,
-                        })
-                },
-            )
-            .collect();
-        Ok(subs)
+        Ok(rows.into_iter().filter_map(row_to_subscription).collect())
     }
 
     pub async fn get_subscription(&self, entry_id: i64) -> Result<Option<Subscription>> {
-        Ok(self
-            .list_subscriptions()
-            .await?
-            .into_iter()
-            .find(|sub| sub.entry_id == entry_id))
+        let row: Option<SubscriptionRow> = sqlx::query_as(
+            "SELECT entry_id, title, keywords, created_at, muted, auto_download, send_file
+             FROM subscriptions WHERE entry_id = ?",
+        )
+        .bind(entry_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(row.and_then(row_to_subscription))
     }
 
     /// 更新订阅级策略（读-改-写整体落库）
@@ -506,35 +519,28 @@ impl Database {
     }
 
     pub async fn get_notified_file_by_id(&self, id: i64) -> Result<Option<NotifiedFile>> {
-        type Row = (i64, i64, String, String, String, Option<i64>, String, i64);
+        type Row = (i64, String, String, String, Option<i64>);
         let row: Option<Row> = sqlx::query_as(
-            "SELECT id, entry_id, entry_name, file_name, file_url, file_size, notified_at, downloaded
-                 FROM notified_files WHERE id = ?",
+            "SELECT entry_id, entry_name, file_name, file_url, file_size
+             FROM notified_files WHERE id = ?",
         )
         .bind(id)
         .fetch_optional(&self.pool)
         .await?;
 
-        Ok(row.and_then(
-            |(id, entry_id, entry_name, file_name, file_url, file_size, ts, downloaded)| {
-                DateTime::parse_from_rfc3339(&ts)
-                    .ok()
-                    .map(|dt| NotifiedFile {
-                        id,
-                        entry_id,
-                        entry_name,
-                        file_name,
-                        file_url,
-                        file_size,
-                        notified_at: dt.with_timezone(&Utc),
-                        downloaded,
-                    })
+        Ok(row.map(
+            |(entry_id, entry_name, file_name, file_url, file_size)| NotifiedFile {
+                entry_id,
+                entry_name,
+                file_name,
+                file_url,
+                file_size,
             },
         ))
     }
 
     pub async fn get_notified_files_count(&self) -> Result<i64> {
-        let row: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM notified_files")
+        let row: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM notified_files WHERE notified = 1")
             .fetch_one(&self.pool)
             .await?;
         Ok(row.0)
@@ -574,16 +580,15 @@ impl Database {
         .await?;
         Ok(self.get_channel_enabled_at().await?.unwrap_or(now))
     }
-
-    pub async fn is_channel_pushed(&self, file_url: &str) -> Result<bool> {
-        let count: (i64,) =
-            sqlx::query_as("SELECT COUNT(*) FROM channel_files WHERE file_url = ? AND pushed != 0")
-                .bind(file_url)
-                .fetch_one(&self.pool)
+    /// 按 entry 一次性读取频道已处理（已推送或死信）的文件 URL 集合
+    pub async fn get_handled_channel_urls(&self, entry_id: i64) -> Result<HashSet<String>> {
+        let rows: Vec<(String,)> =
+            sqlx::query_as("SELECT file_url FROM channel_files WHERE entry_id = ? AND pushed != 0")
+                .bind(entry_id)
+                .fetch_all(&self.pool)
                 .await?;
-        Ok(count.0 > 0)
+        Ok(rows.into_iter().map(|(url,)| url).collect())
     }
-
     /// 静默标记文件已推送（基线前的 backlog，不发频道）
     pub async fn mark_channel_silent(
         &self,
@@ -629,7 +634,10 @@ impl Database {
                 entry_name = excluded.entry_name,
                 file_name = excluded.file_name,
                 file_size = COALESCE(excluded.file_size, channel_files.file_size),
-                pushed = CASE WHEN channel_files.pushed = -1 THEN -1 ELSE 0 END
+                pushed = CASE
+                    WHEN channel_files.pushed IN (1, -1) THEN channel_files.pushed
+                    ELSE 0
+                END
              RETURNING id",
         )
         .bind(entry_id)
@@ -703,6 +711,21 @@ pub struct ChannelFile {
     pub file_size: Option<i64>,
 }
 
+fn row_to_subscription(row: SubscriptionRow) -> Option<Subscription> {
+    let (entry_id, title, keywords, ts, muted, auto_download, send_file) = row;
+    DateTime::parse_from_rfc3339(&ts)
+        .ok()
+        .map(|dt| Subscription {
+            entry_id,
+            title,
+            keywords: parse_keywords(keywords.as_deref()),
+            created_at: dt.with_timezone(&Utc),
+            muted: muted != 0,
+            auto_download: auto_download.map(|v| v != 0),
+            send_file: send_file != 0,
+        })
+}
+
 fn parse_keywords(value: Option<&str>) -> Vec<String> {
     value
         .and_then(|raw| serde_json::from_str::<Vec<String>>(raw).ok())
@@ -731,9 +754,32 @@ mod tests {
             .upsert_pending_file(1, "entry", "file.ass", "http://x/f", Some(10), false)
             .await
             .unwrap();
-        assert!(!db.is_file_notified("http://x/f").await.unwrap());
+        assert!(!db
+            .get_handled_notified_urls(1)
+            .await
+            .unwrap()
+            .contains("http://x/f"));
         db.mark_notified(id).await.unwrap();
-        assert!(db.is_file_notified("http://x/f").await.unwrap());
+        assert!(db
+            .get_handled_notified_urls(1)
+            .await
+            .unwrap()
+            .contains("http://x/f"));
+        // 已通知行再次 upsert 不会被重置为待通知
+        db.upsert_pending_file(1, "entry", "file.ass", "http://x/f", Some(10), true)
+            .await
+            .unwrap();
+        assert!(db
+            .get_handled_notified_urls(1)
+            .await
+            .unwrap()
+            .contains("http://x/f"));
+        assert!(db
+            .get_downloaded_urls(1)
+            .await
+            .unwrap()
+            .contains("http://x/f"));
+        assert!(db.list_pending_notifications().await.unwrap().is_empty());
         assert_eq!(
             db.get_notified_file_by_id(id)
                 .await
@@ -743,20 +789,25 @@ mod tests {
             1
         );
 
-        // 失败重试达到上限转死信
+        // 失败重试达到上限转死信：死信视为已处理终态，不再出现在待重试或未通知判断中
         let id2 = db
             .upsert_pending_file(1, "entry", "dead.ass", "http://x/d", None, false)
             .await
             .unwrap();
+        assert_eq!(db.list_pending_notifications().await.unwrap().len(), 1);
         for _ in 0..5 {
             db.mark_notify_failed(id2, 5).await.unwrap();
         }
-        // 死信行不再被 upsert 复活为待通知
+        // 死信行不再被 upsert 复活为待通知，且 get_handled_notified_urls 包含该 URL 跳过后续轮询
         db.upsert_pending_file(1, "entry", "dead.ass", "http://x/d", None, false)
             .await
             .unwrap();
-        assert!(!db.is_file_notified("http://x/d").await.unwrap());
-
+        assert!(db
+            .get_handled_notified_urls(1)
+            .await
+            .unwrap()
+            .contains("http://x/d"));
+        assert!(db.list_pending_notifications().await.unwrap().is_empty());
         // 订阅策略
         db.add_subscription_details(1, Some("title"), &[])
             .await
@@ -802,19 +853,31 @@ mod tests {
         db.mark_channel_silent(1, "e", "old.srt", "http://x/old", Some(1))
             .await
             .unwrap();
-        assert!(db.is_channel_pushed("http://x/old").await.unwrap());
+        assert!(db
+            .get_handled_channel_urls(1)
+            .await
+            .unwrap()
+            .contains("http://x/old"));
 
         // 占位 → 确认 roundtrip
         let id = db
             .upsert_channel_pending(1, "e", "new.srt", "http://x/new", None)
             .await
             .unwrap();
-        assert!(!db.is_channel_pushed("http://x/new").await.unwrap());
+        assert!(!db
+            .get_handled_channel_urls(1)
+            .await
+            .unwrap()
+            .contains("http://x/new"));
         let pending = db.list_channel_pending().await.unwrap();
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].file_url, "http://x/new");
         db.mark_channel_pushed(id).await.unwrap();
-        assert!(db.is_channel_pushed("http://x/new").await.unwrap());
+        assert!(db
+            .get_handled_channel_urls(1)
+            .await
+            .unwrap()
+            .contains("http://x/new"));
         assert!(db.list_channel_pending().await.unwrap().is_empty());
 
         // 5 次失败转死信，死信行 upsert 不复活
@@ -828,7 +891,11 @@ mod tests {
         db.upsert_channel_pending(1, "e", "dead.srt", "http://x/dead", None)
             .await
             .unwrap();
-        assert!(db.is_channel_pushed("http://x/dead").await.unwrap());
+        assert!(db
+            .get_handled_channel_urls(1)
+            .await
+            .unwrap()
+            .contains("http://x/dead"));
         assert!(db.list_channel_pending().await.unwrap().is_empty());
 
         std::fs::remove_dir_all(&dir).ok();
@@ -870,7 +937,11 @@ mod tests {
         pool.close().await;
 
         let db = Database::new(&url).await.unwrap();
-        assert!(db.is_file_notified("http://x/old").await.unwrap());
+        assert!(db
+            .get_handled_notified_urls(1)
+            .await
+            .unwrap()
+            .contains("http://x/old"));
 
         std::fs::remove_dir_all(&dir).ok();
     }

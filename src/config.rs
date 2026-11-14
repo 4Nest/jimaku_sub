@@ -1,41 +1,53 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct Config {
-    #[serde(default = "default_jimaku")]
+    #[serde(default)]
     pub jimaku: JimakuConfig,
-    #[serde(default = "default_telegram")]
+    #[serde(default)]
     pub telegram: TelegramConfig,
-    #[serde(default = "default_subscription")]
+    #[serde(default)]
     pub subscription: SubscriptionConfig,
-    #[serde(default = "default_download")]
+    #[serde(default)]
     pub download: DownloadConfig,
-    #[serde(default = "default_scheduler")]
+    #[serde(default)]
     pub scheduler: SchedulerConfig,
-    #[serde(default = "default_database")]
+    #[serde(default)]
     pub database: DatabaseConfig,
-    #[serde(default = "default_logging")]
+    #[serde(default)]
     pub logging: LoggingConfig,
-    #[serde(default = "default_channel")]
+    #[serde(default)]
     pub channel: ChannelConfig,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct JimakuConfig {
+    #[serde(default)]
     pub api_key: String,
     #[serde(default = "default_base_url")]
     pub base_url: String,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+impl Default for JimakuConfig {
+    fn default() -> Self {
+        Self {
+            api_key: String::new(),
+            base_url: default_base_url(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct TelegramConfig {
+    #[serde(default)]
     pub bot_token: String,
+    #[serde(default)]
     pub chat_id: String,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct SubscriptionConfig {
     #[serde(default)]
     pub anilist_ids: Vec<i32>,
@@ -45,10 +57,19 @@ pub struct SubscriptionConfig {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct DownloadConfig {
-    #[serde(default = "default_false")]
+    #[serde(default)]
     pub enabled: bool,
     #[serde(default = "default_download_path")]
     pub download_path: String,
+}
+
+impl Default for DownloadConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            download_path: default_download_path(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -57,10 +78,26 @@ pub struct SchedulerConfig {
     pub interval_seconds: u64,
 }
 
+impl Default for SchedulerConfig {
+    fn default() -> Self {
+        Self {
+            interval_seconds: default_interval_seconds(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct DatabaseConfig {
     #[serde(default = "default_database_url")]
     pub url: String,
+}
+
+impl Default for DatabaseConfig {
+    fn default() -> Self {
+        Self {
+            url: default_database_url(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -71,65 +108,23 @@ pub struct LoggingConfig {
     pub retention_days: u32,
 }
 
+impl Default for LoggingConfig {
+    fn default() -> Self {
+        Self {
+            dir: default_log_dir(),
+            retention_days: default_log_retention_days(),
+        }
+    }
+}
+
 /// 全量字幕频道推送
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct ChannelConfig {
-    #[serde(default = "default_false")]
+    #[serde(default)]
     pub enabled: bool,
     /// 数字频道 id（-100 开头），不支持 @username
     #[serde(default)]
     pub chat_id: String,
-}
-
-fn default_jimaku() -> JimakuConfig {
-    JimakuConfig {
-        api_key: String::new(),
-        base_url: default_base_url(),
-    }
-}
-
-fn default_telegram() -> TelegramConfig {
-    TelegramConfig {
-        bot_token: String::new(),
-        chat_id: String::new(),
-    }
-}
-
-fn default_subscription() -> SubscriptionConfig {
-    SubscriptionConfig::default()
-}
-
-fn default_download() -> DownloadConfig {
-    DownloadConfig {
-        enabled: false,
-        download_path: default_download_path(),
-    }
-}
-
-fn default_scheduler() -> SchedulerConfig {
-    SchedulerConfig {
-        interval_seconds: default_interval_seconds(),
-    }
-}
-
-fn default_database() -> DatabaseConfig {
-    DatabaseConfig {
-        url: default_database_url(),
-    }
-}
-
-fn default_logging() -> LoggingConfig {
-    LoggingConfig {
-        dir: default_log_dir(),
-        retention_days: default_log_retention_days(),
-    }
-}
-
-fn default_channel() -> ChannelConfig {
-    ChannelConfig {
-        enabled: false,
-        chat_id: String::new(),
-    }
 }
 
 fn default_database_url() -> String {
@@ -156,106 +151,111 @@ fn default_interval_seconds() -> u64 {
     300
 }
 
-fn default_false() -> bool {
-    false
-}
-
 impl Config {
     pub fn load() -> Result<Self> {
-        let mut builder = config::Config::builder();
+        Self::load_from_path_and_env(Path::new("config.toml"), |key| std::env::var(key).ok())
+    }
 
-        // 默认配置
-        builder = builder.set_default("jimaku.api_key", "")?;
-        builder = builder.set_default("jimaku.base_url", "https://jimaku.cc")?;
-        builder = builder.set_default("telegram.bot_token", "")?;
-        builder = builder.set_default("telegram.chat_id", "")?;
-        builder = builder.set_default("download.enabled", false)?;
-        builder = builder.set_default("download.download_path", "/app/downloads")?;
-        builder = builder.set_default("scheduler.interval_seconds", 300)?;
-        builder = builder.set_default("database.url", "sqlite://data/jimaku_subscriber.db")?;
-        builder = builder.set_default("logging.dir", "./logs")?;
-        builder = builder.set_default("logging.retention_days", 30)?;
-        builder = builder.set_default("channel.enabled", false)?;
-        builder = builder.set_default("channel.chat_id", "")?;
+    pub fn load_from_path_and_env(
+        path: &Path,
+        get_env: impl Fn(&str) -> Option<String>,
+    ) -> Result<Self> {
+        let mut cfg = if path.exists() {
+            let raw = std::fs::read_to_string(path)
+                .with_context(|| format!("Failed to read config file: {}", path.display()))?;
+            toml::from_str::<Config>(&raw)
+                .with_context(|| format!("Failed to parse config file: {}", path.display()))?
+        } else {
+            Config::default()
+        };
 
-        // 从配置文件读取
-        if Path::new("config.toml").exists() {
-            builder = builder.add_source(config::File::with_name("config.toml"));
-        }
+        cfg.apply_env_overrides(get_env)?;
+        cfg.validate()?;
+        Ok(cfg)
+    }
 
-        // 从环境变量读取
-        builder = builder.add_source(
-            config::Environment::with_prefix("")
-                .separator("__")
-                .try_parsing(true),
-        );
+    fn apply_env_overrides(&mut self, get_env: impl Fn(&str) -> Option<String>) -> Result<()> {
+        let non_empty = |key: &str| -> Option<String> {
+            get_env(key)
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+        };
 
-        let mut cfg: Config = builder.build()?.try_deserialize()?;
-
-        // 特殊处理环境变量（支持 JIMAKU_API_KEY, TELEGRAM_BOT_TOKEN 等）
-        if let Ok(v) = std::env::var("JIMAKU_API_KEY") {
-            cfg.jimaku.api_key = v;
+        if let Some(v) = non_empty("JIMAKU_API_KEY") {
+            self.jimaku.api_key = v;
         }
-        if let Ok(v) = std::env::var("TELEGRAM_BOT_TOKEN") {
-            cfg.telegram.bot_token = v;
+        if let Some(v) = non_empty("JIMAKU_BASE_URL") {
+            self.jimaku.base_url = v;
         }
-        if let Ok(v) = std::env::var("TELEGRAM_CHAT_ID") {
-            cfg.telegram.chat_id = v;
+        if let Some(v) = non_empty("TELEGRAM_BOT_TOKEN") {
+            self.telegram.bot_token = v;
         }
-        if let Ok(v) = std::env::var("DOWNLOAD_ENABLED") {
-            cfg.download.enabled = v.parse().unwrap_or(false);
+        if let Some(v) = non_empty("TELEGRAM_CHAT_ID") {
+            self.telegram.chat_id = v;
         }
-        if let Ok(v) = std::env::var("DOWNLOAD_PATH") {
-            cfg.download.download_path = v;
+        if let Some(v) = non_empty("DOWNLOAD_ENABLED") {
+            self.download.enabled = parse_bool_env("DOWNLOAD_ENABLED", &v)?;
         }
-        if let Ok(v) = std::env::var("SCHEDULER_INTERVAL_SECONDS") {
-            cfg.scheduler.interval_seconds = v.parse().unwrap_or(300);
+        if let Some(v) = non_empty("DOWNLOAD_PATH") {
+            self.download.download_path = v;
         }
-        if let Ok(v) = std::env::var("DATABASE_URL") {
-            cfg.database.url = v;
+        if let Some(v) = non_empty("SCHEDULER_INTERVAL_SECONDS") {
+            self.scheduler.interval_seconds = v
+                .parse()
+                .with_context(|| format!("Invalid SCHEDULER_INTERVAL_SECONDS: {v}"))?;
         }
-        if let Ok(v) = std::env::var("LOG_DIR") {
-            cfg.logging.dir = v;
+        if let Some(v) = non_empty("DATABASE_URL") {
+            self.database.url = v;
         }
-        if let Ok(v) = std::env::var("LOG_RETENTION_DAYS") {
-            cfg.logging.retention_days = v.parse().unwrap_or(30);
+        if let Some(v) = non_empty("LOG_DIR") {
+            self.logging.dir = v;
         }
-        if let Ok(v) = std::env::var("CHANNEL_ENABLED") {
-            cfg.channel.enabled = v.parse().unwrap_or(false);
+        if let Some(v) = non_empty("LOG_RETENTION_DAYS") {
+            self.logging.retention_days = v
+                .parse()
+                .with_context(|| format!("Invalid LOG_RETENTION_DAYS: {v}"))?;
         }
-        if let Ok(v) = std::env::var("CHANNEL_CHAT_ID") {
-            cfg.channel.chat_id = v;
+        if let Some(v) = non_empty("CHANNEL_ENABLED") {
+            self.channel.enabled = parse_bool_env("CHANNEL_ENABLED", &v)?;
         }
-        // 解析逗号分隔的 anilist_ids
-        if let Ok(v) = std::env::var("SUBSCRIPTION_ANILIST_IDS") {
-            cfg.subscription.anilist_ids = v
+        if let Some(v) = non_empty("CHANNEL_CHAT_ID") {
+            self.channel.chat_id = v;
+        }
+        if let Some(v) = non_empty("SUBSCRIPTION_ANILIST_IDS") {
+            self.subscription.anilist_ids = v
                 .split(',')
-                .filter_map(|s| s.trim().parse::<i32>().ok())
-                .collect();
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(|s| {
+                    s.parse::<i32>().with_context(|| {
+                        format!("Invalid AniList ID in SUBSCRIPTION_ANILIST_IDS: {s}")
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
         }
-        // 解析逗号分隔的 name_keywords
-        if let Ok(v) = std::env::var("SUBSCRIPTION_NAME_KEYWORDS") {
-            cfg.subscription.name_keywords = v
+        if let Some(v) = non_empty("SUBSCRIPTION_NAME_KEYWORDS") {
+            self.subscription.name_keywords = v
                 .split(',')
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
                 .map(ToOwned::to_owned)
                 .collect();
         }
-
-        cfg.validate()?;
-        Ok(cfg)
+        Ok(())
     }
 
     pub fn validate(&self) -> Result<()> {
-        if self.jimaku.api_key.is_empty() {
+        if self.jimaku.api_key.trim().is_empty() {
             anyhow::bail!("Jimaku API key is required");
         }
-        if self.telegram.bot_token.is_empty() {
+        if self.telegram.bot_token.trim().is_empty() {
             anyhow::bail!("Telegram bot token is required");
         }
-        if self.telegram.chat_id.is_empty() {
+        if self.telegram.chat_id.trim().is_empty() {
             anyhow::bail!("Telegram chat ID is required");
+        }
+        if self.scheduler.interval_seconds == 0 {
+            anyhow::bail!("SCHEDULER_INTERVAL_SECONDS must be greater than 0");
         }
         if self.channel.enabled {
             match self.channel.chat_id.trim().parse::<i64>() {
@@ -266,5 +266,65 @@ impl Config {
             }
         }
         Ok(())
+    }
+}
+
+fn parse_bool_env(name: &str, raw: &str) -> Result<bool> {
+    match raw.to_ascii_lowercase().as_str() {
+        "true" | "1" | "yes" => Ok(true),
+        "false" | "0" | "no" => Ok(false),
+        _ => anyhow::bail!("Invalid boolean for {name}: {raw}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Config;
+    use std::collections::HashMap;
+
+    #[test]
+    fn empty_env_does_not_override_toml_values() {
+        let dir = std::env::temp_dir().join(format!("jimaku-cfg-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+            [jimaku]
+            api_key = "k"
+            [telegram]
+            bot_token = "t"
+            chat_id = "123"
+            [download]
+            enabled = true
+            [channel]
+            enabled = true
+            chat_id = "-100123456"
+            "#,
+        )
+        .unwrap();
+
+        let env = HashMap::from([("CHANNEL_CHAT_ID", ""), ("SUBSCRIPTION_ANILIST_IDS", "   ")]);
+        let cfg = Config::load_from_path_and_env(&path, |k| env.get(k).map(|v| (*v).to_string()))
+            .unwrap();
+        assert!(cfg.download.enabled);
+        assert!(cfg.channel.enabled);
+        assert_eq!(cfg.channel.chat_id, "-100123456");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn rejects_zero_scheduler_interval() {
+        let env = HashMap::from([
+            ("JIMAKU_API_KEY", "k"),
+            ("TELEGRAM_BOT_TOKEN", "t"),
+            ("TELEGRAM_CHAT_ID", "123"),
+            ("SCHEDULER_INTERVAL_SECONDS", "0"),
+        ]);
+        let missing = std::path::Path::new("/nonexistent-jimaku-config.toml");
+        let err = Config::load_from_path_and_env(missing, |k| env.get(k).map(|v| (*v).to_string()))
+            .unwrap_err();
+        assert!(err.to_string().contains("SCHEDULER_INTERVAL_SECONDS"));
     }
 }
