@@ -3,8 +3,9 @@ use crate::{
     config::Config,
     database::{Database, Subscription},
     downloader::{Downloader, FetchedSubtitle},
+    goindex::{GoIndexClient, GoIndexFile, GOINDEX_ENTRY_ID},
     jimaku::{Entry, FileEntry, JimakuClient},
-    telegram::{ChannelNotifier, DocumentSource, NewSubtitle, TelegramNotifier},
+    telegram::{ChannelNotifier, DocumentSource, NewSubtitle, SubtitleSource, TelegramNotifier},
 };
 use anyhow::Result;
 use chrono::{DateTime, NaiveDate, Utc};
@@ -16,15 +17,18 @@ use tracing::{debug, error, info, warn};
 pub struct Scheduler {
     config: Config,
     jimaku: Arc<JimakuClient>,
+    goindex: Option<Arc<GoIndexClient>>,
     db: Arc<Database>,
     notifier: TelegramNotifier,
     channel: Option<ChannelNotifier>,
     downloader: Arc<Downloader>,
     check_lock: tokio::sync::Mutex<()>,
     last_log_cleanup: std::sync::Mutex<Option<NaiveDate>>,
+    sub_entry_cache: tokio::sync::Mutex<HashMap<i64, Entry>>,
 }
 
 /// 一个 entry 命中订阅后聚合出的处理策略
+#[derive(Debug, PartialEq, Eq)]
 struct EntryPolicy {
     keyword_filter: Option<Vec<String>>,
     /// 命中订阅全部被静音时为 false：静默记录，不推送
@@ -38,6 +42,7 @@ impl Scheduler {
     pub fn new(
         config: Config,
         jimaku: Arc<JimakuClient>,
+        goindex: Option<Arc<GoIndexClient>>,
         db: Arc<Database>,
         downloader: Arc<Downloader>,
         notifier: TelegramNotifier,
@@ -46,12 +51,14 @@ impl Scheduler {
         Self {
             config,
             jimaku,
+            goindex,
             db,
             notifier,
             channel,
             downloader,
             check_lock: tokio::sync::Mutex::new(()),
             last_log_cleanup: std::sync::Mutex::new(None),
+            sub_entry_cache: tokio::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -117,14 +124,7 @@ impl Scheduler {
     }
 
     async fn check_inner(&self, cancel: &CancellationToken) -> Result<()> {
-        info!("Starting Jimaku check...");
-
-        let last_check = self.db.get_last_check_time().await?;
-        let now = Utc::now().timestamp();
-
-        // 首次运行：检查最近 1 小时的条目
-        let after = last_check.unwrap_or(now - 3600);
-        debug!("Checking entries after timestamp: {}", after);
+        info!("Starting subtitle check...");
 
         let dynamic_subs = self.db.list_subscriptions().await?;
 
@@ -162,12 +162,55 @@ impl Scheduler {
             return Ok(());
         }
 
+        // 3) Jimaku 轮询（独立容错，不阻断 GoIndex 同步）
+        let jimaku_res = self
+            .check_jimaku(channel_baseline, &dynamic_subs, cancel)
+            .await;
+        if let Err(ref e) = jimaku_res {
+            error!("Jimaku check failed: {}", e);
+        }
+
+        if cancel.is_cancelled() {
+            return Ok(());
+        }
+
+        // 4) GoIndex 放送字幕站轮询
+        let goindex_res = if let Some(ref goindex) = self.goindex {
+            let res = self.check_goindex(goindex, &dynamic_subs, cancel).await;
+            if let Err(ref e) = res {
+                error!("GoIndex check failed: {}", e);
+            }
+            res
+        } else {
+            Ok(())
+        };
+
+        self.write_heartbeat().await;
+        jimaku_res?;
+        goindex_res?;
+        info!("Subtitle check completed");
+        Ok(())
+    }
+
+    async fn check_jimaku(
+        &self,
+        channel_baseline: Option<DateTime<Utc>>,
+        dynamic_subs: &[Subscription],
+        cancel: &CancellationToken,
+    ) -> Result<()> {
+        let last_check = self.db.get_last_check_time().await?;
+        let now = Utc::now().timestamp();
+
+        // 首次运行：检查最近 1 小时的条目
+        let after = last_check.unwrap_or(now - 3600);
+        debug!("Checking Jimaku entries after timestamp: {}", after);
+
         let entries = match self.search_entries_with_retry(after, cancel).await {
             Ok(Some(entries)) => entries,
             Ok(None) => return Ok(()),
             Err(e) => return Err(e),
         };
-        info!("Found {} entries since last check", entries.len());
+        info!("Found {} Jimaku entries since last check", entries.len());
 
         let mut had_entry_error = false;
 
@@ -177,7 +220,7 @@ impl Scheduler {
                 return Ok(());
             }
 
-            let policy = self.resolve_entry_policy(&entry, &dynamic_subs);
+            let policy = self.resolve_entry_policy(&entry, dynamic_subs);
             if policy.is_none() && self.channel.is_none() {
                 debug!("Entry {} does not match subscription, skipping", entry.id);
                 continue;
@@ -232,9 +275,297 @@ impl Scheduler {
             self.db.set_last_check_time(now).await?;
         }
 
-        self.write_heartbeat().await;
-        info!("Jimaku check completed");
         Ok(())
+    }
+
+    async fn check_goindex(
+        &self,
+        goindex: &GoIndexClient,
+        dynamic_subs: &[Subscription],
+        cancel: &CancellationToken,
+    ) -> Result<()> {
+        let has_sub_filters =
+            !self.config.subscription.name_keywords.is_empty() || !dynamic_subs.is_empty();
+        if self.channel.is_none() && !has_sub_filters {
+            debug!(
+                "GoIndex skipped: neither channel push nor keyword/dynamic subscriptions active"
+            );
+            return Ok(());
+        }
+
+        let files = match self.list_goindex_with_retry(goindex, cancel).await {
+            Ok(Some(files)) => files,
+            Ok(None) => return Ok(()),
+            Err(e) => return Err(e),
+        };
+        info!("Listed {} subtitle files from GoIndex", files.len());
+        if files.is_empty() {
+            return Ok(());
+        }
+
+        let sub_entries = self.refresh_sub_entry_cache(dynamic_subs, cancel).await;
+        if cancel.is_cancelled() {
+            return Ok(());
+        }
+
+        // 1) 全量频道推送（包含首次启动时的站内现有存量，后续通过 channel_files.file_url 去重）
+        if let Some(ref channel) = self.channel {
+            match self.db.get_handled_channel_urls(GOINDEX_ENTRY_ID).await {
+                Ok(handled_urls) => {
+                    for file in &files {
+                        if cancel.is_cancelled() {
+                            return Ok(());
+                        }
+                        if handled_urls.contains(&file.url) {
+                            continue;
+                        }
+
+                        let matched_policy = resolve_goindex_policy(
+                            &self.config.subscription.name_keywords,
+                            self.config.download.enabled,
+                            &file.name,
+                            &file.program_title,
+                            dynamic_subs,
+                            &sub_entries,
+                        );
+                        let persist_to_disk = self.config.download.enabled
+                            || matched_policy.as_ref().is_some_and(|p| p.auto_download);
+
+                        let row_id = match self
+                            .db
+                            .upsert_channel_pending(
+                                GOINDEX_ENTRY_ID,
+                                &file.program_title,
+                                &file.name,
+                                &file.url,
+                                Some(file.size),
+                            )
+                            .await
+                        {
+                            Ok(id) => id,
+                            Err(e) => {
+                                warn!(
+                                    "Failed to upsert GoIndex channel pending {}: {}",
+                                    file.name, e
+                                );
+                                continue;
+                            }
+                        };
+
+                        let sub = ChannelSubtitle {
+                            japanese_name: Some(&file.program_title),
+                            file_name: &file.name,
+                            file_size: file.size,
+                            file_url: &file.url,
+                            source: SubtitleSource::GoIndex {
+                                site_url: goindex.base_url(),
+                            },
+                            anilist_id: matched_anilist_id(
+                                &file.name,
+                                &file.program_title,
+                                dynamic_subs,
+                                &sub_entries,
+                            ),
+                            file_modified: file.modified_time,
+                        };
+
+                        let result = self
+                            .deliver_to_channel(
+                                channel,
+                                &file.program_title,
+                                &file.name,
+                                &file.url,
+                                file.size,
+                                persist_to_disk,
+                                &sub,
+                            )
+                            .await;
+
+                        self.handle_channel_result(row_id, &file.name, result).await;
+                        self.write_heartbeat().await;
+
+                        if !cancellable_sleep(CHANNEL_SEND_INTERVAL, cancel).await {
+                            return Ok(());
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!("Failed to load GoIndex handled channel URLs: {}", e);
+                }
+            }
+        }
+
+        if cancel.is_cancelled() || !has_sub_filters {
+            return Ok(());
+        }
+
+        // 2) 关键词与动态订阅匹配 → 私聊通知 / 自动下载
+        let handled_notified = self.db.get_handled_notified_urls(GOINDEX_ENTRY_ID).await?;
+        for file in &files {
+            if cancel.is_cancelled() {
+                return Ok(());
+            }
+            if handled_notified.contains(&file.url) {
+                continue;
+            }
+            let Some(policy) = resolve_goindex_policy(
+                &self.config.subscription.name_keywords,
+                self.config.download.enabled,
+                &file.name,
+                &file.program_title,
+                dynamic_subs,
+                &sub_entries,
+            ) else {
+                continue;
+            };
+
+            let mut downloaded = false;
+            let mut downloaded_outcome = None;
+            if policy.auto_download {
+                match self
+                    .downloader
+                    .download_subtitle_with_outcome(&file.program_title, &file.name, &file.url)
+                    .await
+                {
+                    Ok(outcome) => {
+                        downloaded = true;
+                        downloaded_outcome = Some(outcome);
+                    }
+                    Err(e) => {
+                        warn!("Failed to download GoIndex subtitle {}: {}", file.name, e);
+                    }
+                }
+            }
+
+            let file_id = self
+                .db
+                .upsert_pending_file(
+                    GOINDEX_ENTRY_ID,
+                    &file.program_title,
+                    &file.name,
+                    &file.url,
+                    Some(file.size),
+                    downloaded,
+                )
+                .await?;
+
+            if !policy.notify {
+                debug!(
+                    "Subscription muted, silently recording GoIndex {}",
+                    file.name
+                );
+                self.db.mark_notified(file_id).await?;
+                continue;
+            }
+
+            let send_res = self
+                .notifier
+                .notify_new_subtitle(&NewSubtitle {
+                    file_id,
+                    entry_name: &file.program_title,
+                    english_name: None,
+                    japanese_name: None,
+                    file_name: &file.name,
+                    file_size: file.size,
+                    file_url: &file.url,
+                    file_modified: file.modified_time,
+                    source: SubtitleSource::GoIndex {
+                        site_url: goindex.base_url(),
+                    },
+                    downloaded,
+                })
+                .await;
+
+            match send_res {
+                Ok(_) => {
+                    self.db.mark_notified(file_id).await?;
+                    if policy.send_file {
+                        self.send_subtitle_file(
+                            file_id,
+                            &file.program_title,
+                            &file.name,
+                            &file.url,
+                            file.size,
+                            policy.auto_download,
+                            downloaded_outcome.map(|o| (o.path, o.size)),
+                        )
+                        .await;
+                    }
+                }
+                Err(e) if send_maybe_delivered(&e) => {
+                    warn!(
+                        "Notification for {} timed out after reaching Telegram, treating as delivered: {}",
+                        file.name, e
+                    );
+                    self.db.mark_notified(file_id).await?;
+                }
+                Err(e) => {
+                    self.record_notify_failure(file_id, &file.name, &e).await?;
+                }
+            }
+
+            self.write_heartbeat().await;
+            if !cancellable_sleep(NOTIFY_INTERVAL, cancel).await {
+                return Ok(());
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn refresh_sub_entry_cache(
+        &self,
+        dynamic_subs: &[Subscription],
+        cancel: &CancellationToken,
+    ) -> HashMap<i64, Entry> {
+        let active_ids: std::collections::HashSet<i64> =
+            dynamic_subs.iter().map(|s| s.entry_id).collect();
+        let missing: Vec<i64> = {
+            let mut cache = self.sub_entry_cache.lock().await;
+            cache.retain(|id, _| active_ids.contains(id));
+            active_ids
+                .iter()
+                .copied()
+                .filter(|id| *id > 0 && !cache.contains_key(id))
+                .collect()
+        };
+
+        for entry_id in missing {
+            if cancel.is_cancelled() {
+                break;
+            }
+            if let Ok(entry) = self.jimaku.get_entry_by_id(entry_id).await {
+                self.sub_entry_cache.lock().await.insert(entry_id, entry);
+            }
+        }
+
+        self.sub_entry_cache.lock().await.clone()
+    }
+
+    async fn list_goindex_with_retry(
+        &self,
+        goindex: &GoIndexClient,
+        cancel: &CancellationToken,
+    ) -> Result<Option<Vec<GoIndexFile>>> {
+        const MAX_ATTEMPTS: u32 = 3;
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            match goindex.list_subtitle_files().await {
+                Ok(files) => return Ok(Some(files)),
+                Err(e) if attempt < MAX_ATTEMPTS => {
+                    let backoff = Duration::from_secs(1 << (attempt - 1));
+                    warn!(
+                        "GoIndex list failed (attempt {}/{}): {}, retrying in {:?}",
+                        attempt, MAX_ATTEMPTS, e, backoff
+                    );
+                    if !cancellable_sleep(backoff, cancel).await {
+                        return Ok(None);
+                    }
+                }
+                Err(e) => return Err(e),
+            }
+        }
     }
 
     /// 计算 entry 命中的订阅策略；未命中任何配置/动态订阅时返回 `None`
@@ -415,7 +746,7 @@ impl Scheduler {
                     file_size: file.size,
                     file_url: &file.url,
                     file_modified: file.last_modified,
-                    entry_id: entry.id,
+                    source: SubtitleSource::Jimaku { entry_id: entry.id },
                     downloaded,
                 })
                 .await;
@@ -468,23 +799,50 @@ impl Scheduler {
         }
         info!("Retrying {} pending subtitle notifications", pending.len());
 
+        let sub_entries = self.refresh_sub_entry_cache(dynamic_subs, cancel).await;
         let mut entry_cache: HashMap<i64, Option<Entry>> = HashMap::new();
+        let goindex_site_url = self.config.goindex.base_url.trim().trim_end_matches('/');
 
         for item in pending {
             if cancel.is_cancelled() {
                 return Ok(());
             }
 
-            let entry = match entry_cache.get(&item.entry_id) {
-                Some(cached) => cached.as_ref(),
-                None => {
-                    let fetched = self.jimaku.get_entry_by_id(item.entry_id).await.ok();
-                    entry_cache.insert(item.entry_id, fetched);
-                    entry_cache[&item.entry_id].as_ref()
-                }
+            let (entry, policy, source) = if item.entry_id == GOINDEX_ENTRY_ID {
+                let policy = resolve_goindex_policy(
+                    &self.config.subscription.name_keywords,
+                    self.config.download.enabled,
+                    &item.file_name,
+                    &item.entry_name,
+                    dynamic_subs,
+                    &sub_entries,
+                );
+                (
+                    None,
+                    policy,
+                    SubtitleSource::GoIndex {
+                        site_url: goindex_site_url,
+                    },
+                )
+            } else {
+                let entry = match entry_cache.get(&item.entry_id) {
+                    Some(cached) => cached.as_ref(),
+                    None => {
+                        let fetched = self.jimaku.get_entry_by_id(item.entry_id).await.ok();
+                        entry_cache.insert(item.entry_id, fetched);
+                        entry_cache[&item.entry_id].as_ref()
+                    }
+                };
+                let policy = entry.and_then(|e| self.resolve_entry_policy(e, dynamic_subs));
+                (
+                    entry,
+                    policy,
+                    SubtitleSource::Jimaku {
+                        entry_id: item.entry_id,
+                    },
+                )
             };
 
-            let policy = entry.and_then(|e| self.resolve_entry_policy(e, dynamic_subs));
             // 如果在此期间用户已退订或将订阅设为静音，直接结案不再推送
             if policy.as_ref().is_some_and(|p| !p.notify) {
                 self.db.mark_notified(item.id).await?;
@@ -502,7 +860,7 @@ impl Scheduler {
                     file_size: item.file_size.unwrap_or(0),
                     file_url: &item.file_url,
                     file_modified: Utc::now(),
-                    entry_id: item.entry_id,
+                    source,
                     downloaded: item.downloaded,
                 })
                 .await;
@@ -652,7 +1010,7 @@ impl Scheduler {
                 japanese_name: entry.japanese_name.as_deref(),
                 file_name: &file.name,
                 file_size: file.size,
-                entry_id: entry.id,
+                source: SubtitleSource::Jimaku { entry_id: entry.id },
                 file_url: &file.url,
                 anilist_id: entry.anilist_id,
                 file_modified: file.last_modified,
@@ -688,32 +1046,46 @@ impl Scheduler {
 
         let mut entry_cache: HashMap<i64, Option<Entry>> = HashMap::new();
         let channel = self.channel.as_ref().expect("channel notifier missing");
+        let goindex_site_url = self.config.goindex.base_url.trim().trim_end_matches('/');
 
         for file in pending {
             if cancel.is_cancelled() {
                 return Ok(());
             }
 
-            let entry = match entry_cache.get(&file.entry_id) {
-                Some(cached) => cached.as_ref(),
-                None => {
-                    let fetched = self.jimaku.get_entry_by_id(file.entry_id).await.ok();
-                    entry_cache.insert(file.entry_id, fetched);
-                    entry_cache[&file.entry_id].as_ref()
-                }
-            };
-
-            let ja = entry.and_then(|e| e.japanese_name.as_deref());
             let size = file.file_size.unwrap_or(0);
-
-            let sub = ChannelSubtitle {
-                japanese_name: ja,
-                file_name: &file.file_name,
-                file_size: size,
-                entry_id: file.entry_id,
-                file_url: &file.file_url,
-                anilist_id: entry.and_then(|e| e.anilist_id),
-                file_modified: Utc::now(),
+            let sub = if file.entry_id == GOINDEX_ENTRY_ID {
+                ChannelSubtitle {
+                    japanese_name: Some(&file.entry_name),
+                    file_name: &file.file_name,
+                    file_size: size,
+                    source: SubtitleSource::GoIndex {
+                        site_url: goindex_site_url,
+                    },
+                    file_url: &file.file_url,
+                    anilist_id: None,
+                    file_modified: Utc::now(),
+                }
+            } else {
+                let entry = match entry_cache.get(&file.entry_id) {
+                    Some(cached) => cached.as_ref(),
+                    None => {
+                        let fetched = self.jimaku.get_entry_by_id(file.entry_id).await.ok();
+                        entry_cache.insert(file.entry_id, fetched);
+                        entry_cache[&file.entry_id].as_ref()
+                    }
+                };
+                ChannelSubtitle {
+                    japanese_name: entry.and_then(|e| e.japanese_name.as_deref()),
+                    file_name: &file.file_name,
+                    file_size: size,
+                    source: SubtitleSource::Jimaku {
+                        entry_id: file.entry_id,
+                    },
+                    file_url: &file.file_url,
+                    anilist_id: entry.and_then(|e| e.anilist_id),
+                    file_modified: Utc::now(),
+                }
             };
 
             let result = self
@@ -1042,11 +1414,135 @@ fn file_matches_keywords(file_name: &str, keywords: &[String]) -> bool {
         .map(|keyword| keyword.trim().to_lowercase())
         .any(|keyword| !keyword.is_empty() && file_name.contains(&keyword))
 }
+
+fn normalize_match_title(s: &str) -> String {
+    s.trim()
+        .trim_end_matches(['。', '.', '！', '!', '？', '?'])
+        .trim()
+        .to_lowercase()
+}
+
+fn goindex_matches_subscription(
+    file_name: &str,
+    program_title: &str,
+    sub: &Subscription,
+    entry: Option<&Entry>,
+) -> bool {
+    let prog_norm = normalize_match_title(program_title);
+    if prog_norm.is_empty() {
+        return false;
+    }
+
+    let mut candidates: Vec<&str> = Vec::with_capacity(4);
+    if let Some(t) = sub.title.as_deref() {
+        candidates.push(t);
+    }
+    if let Some(e) = entry {
+        candidates.push(&e.name);
+        if let Some(en) = e.english_name.as_deref() {
+            candidates.push(en);
+        }
+        if let Some(ja) = e.japanese_name.as_deref() {
+            candidates.push(ja);
+        }
+    }
+
+    let title_matched = candidates.into_iter().any(|cand| {
+        let norm = normalize_match_title(cand);
+        norm.chars().count() >= 2 && prog_norm.contains(&norm)
+    });
+    if !title_matched {
+        return false;
+    }
+
+    sub.keywords.is_empty() || file_matches_keywords(file_name, &sub.keywords)
+}
+
+fn matched_anilist_id(
+    file_name: &str,
+    program_title: &str,
+    dynamic_subs: &[Subscription],
+    sub_entries: &HashMap<i64, Entry>,
+) -> Option<i32> {
+    dynamic_subs.iter().find_map(|sub| {
+        let entry = sub_entries.get(&sub.entry_id);
+        if goindex_matches_subscription(file_name, program_title, sub, entry) {
+            entry.and_then(|e| e.anilist_id)
+        } else {
+            None
+        }
+    })
+}
+
+/// 计算单个 GoIndex 文件命中的订阅策略（配置关键词 + 动态订阅联合匹配）
+fn resolve_goindex_policy(
+    config_keywords: &[String],
+    download_enabled: bool,
+    file_name: &str,
+    program_title: &str,
+    dynamic_subs: &[Subscription],
+    sub_entries: &HashMap<i64, Entry>,
+) -> Option<EntryPolicy> {
+    let file_lower = file_name.to_lowercase();
+    let title_lower = program_title.to_lowercase();
+
+    let config_match = config_keywords
+        .iter()
+        .map(|kw| kw.trim())
+        .filter(|kw| !kw.is_empty())
+        .any(|kw| {
+            let kw = kw.to_lowercase();
+            file_lower.contains(&kw) || title_lower.contains(&kw)
+        });
+
+    let matching_dynamic: Vec<&Subscription> = dynamic_subs
+        .iter()
+        .filter(|sub| {
+            let entry = sub_entries.get(&sub.entry_id);
+            goindex_matches_subscription(file_name, program_title, sub, entry)
+        })
+        .collect();
+
+    if !config_match && matching_dynamic.is_empty() {
+        return None;
+    }
+
+    if config_match {
+        Some(EntryPolicy {
+            keyword_filter: None,
+            notify: true,
+            auto_download: download_enabled,
+            send_file: false,
+        })
+    } else {
+        let explicit_download: Vec<bool> = matching_dynamic
+            .iter()
+            .filter_map(|sub| sub.auto_download)
+            .collect();
+        let auto_download = if explicit_download.is_empty() {
+            download_enabled
+        } else {
+            explicit_download.into_iter().any(|enabled| enabled)
+        };
+        Some(EntryPolicy {
+            keyword_filter: None,
+            notify: matching_dynamic.iter().any(|sub| !sub.muted),
+            auto_download,
+            send_file: matching_dynamic.iter().any(|sub| sub.send_file),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{channel_file_action, file_matches_keywords, ChannelAction};
+    use super::{
+        channel_file_action, file_matches_keywords, resolve_goindex_policy, ChannelAction,
+        EntryPolicy,
+    };
+    use crate::database::Subscription;
     use crate::jimaku::{Entry, JimakuClient};
     use chrono::{Duration, Utc};
+    use std::collections::HashMap;
 
     #[test]
     fn channel_action_matrix() {
@@ -1109,5 +1605,84 @@ mod tests {
         };
 
         assert!(!config_match);
+    }
+
+    #[test]
+    fn goindex_policy_matches_config_keywords_and_dynamic_japanese_title_with_release_rule() {
+        let sub = Subscription {
+            entry_id: 12711,
+            title: Some(
+                "The Laid-Off Cheat-Granting Mage Enjoys a Second Lease on Life".to_string(),
+            ),
+            keywords: vec!["AT-X".to_string()],
+            created_at: Utc::now(),
+            muted: false,
+            auto_download: Some(true),
+            send_file: true,
+        };
+        let entry = Entry {
+            id: 12711,
+            name: "Tsuihou Sareta Cheat Fuyo Majutsushi".to_string(),
+            english_name: sub.title.clone(),
+            japanese_name: Some(
+                "追放されたチート付与魔術師は気ままなセカンドライフを謳歌する。".to_string(),
+            ),
+            anilist_id: Some(180000),
+            tmdb_id: None,
+            last_modified: Utc::now(),
+            flags: serde_json::json!({}),
+            notes: None,
+            creator_id: None,
+        };
+        let entries = HashMap::from([(12711, entry)]);
+
+        // 标题命中但非 AT-X 放送局 → 不触发 AT-X 限定订阅
+        assert_eq!(
+            resolve_goindex_policy(
+                &[],
+                false,
+                "20261104 0006 [テレビ愛知1] 追放されたチート付与魔術師は気ままなセカンドライフを謳歌する。 #5[字].ass",
+                "追放されたチート付与魔術師は気ままなセカンドライフを謳歌する。",
+                std::slice::from_ref(&sub),
+                &entries,
+            ),
+            None
+        );
+
+        // AT-X 放送局 → 命中动态订阅并继承订阅策略
+        assert_eq!(
+            resolve_goindex_policy(
+                &[],
+                false,
+                "20261104 2100 [AT-X] 追放されたチート付与魔術師は気ままなセカンドライフを謳歌する #5 [字].ass",
+                "追放されたチート付与魔術師は気ままなセカンドライフを謳歌する",
+                std::slice::from_ref(&sub),
+                &entries,
+            ),
+            Some(EntryPolicy {
+                keyword_filter: None,
+                notify: true,
+                auto_download: true,
+                send_file: true,
+            })
+        );
+
+        // 配置关键词直接匹配
+        assert_eq!(
+            resolve_goindex_policy(
+                &["千歳くん".to_string()],
+                false,
+                "20261103 2300 [AT-X] 千歳くんはラムネ瓶のなか #17 [字].ass",
+                "千歳くんはラムネ瓶のなか",
+                &[],
+                &HashMap::new(),
+            ),
+            Some(EntryPolicy {
+                keyword_filter: None,
+                notify: true,
+                auto_download: false,
+                send_file: false,
+            })
+        );
     }
 }

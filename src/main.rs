@@ -2,6 +2,7 @@ mod bot;
 mod config;
 mod database;
 mod downloader;
+mod goindex;
 mod jimaku;
 mod scheduler;
 mod telegram;
@@ -21,6 +22,7 @@ use crate::bot::AppState;
 use crate::config::{Config, LoggingConfig};
 use crate::database::Database;
 use crate::downloader::Downloader;
+use crate::goindex::GoIndexClient;
 use crate::jimaku::JimakuClient;
 use crate::scheduler::Scheduler;
 use crate::telegram::{ChannelNotifier, TelegramNotifier};
@@ -43,6 +45,14 @@ async fn main() -> Result<()> {
         JimakuClient::new(&config.jimaku.base_url, &config.jimaku.api_key)
             .context("Failed to create Jimaku client")?,
     );
+    let goindex = if config.goindex.enabled {
+        let client = GoIndexClient::new(&config.goindex.base_url, &config.goindex.password)
+            .context("Failed to create GoIndex client")?;
+        info!("GoIndex sync enabled: {}", client.base_url());
+        Some(Arc::new(client))
+    } else {
+        None
+    };
     let downloader = Arc::new(Downloader::new(&config.download.download_path));
 
     let notifier = TelegramNotifier::new(&config.telegram.bot_token, &config.telegram.chat_id)
@@ -65,6 +75,7 @@ async fn main() -> Result<()> {
     let scheduler = Arc::new(Scheduler::new(
         config.clone(),
         jimaku.clone(),
+        goindex,
         db.clone(),
         downloader.clone(),
         notifier.clone(),

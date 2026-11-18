@@ -21,6 +21,10 @@ services:
       # 全量字幕频道推送（bot 需加为频道管理员）
       - CHANNEL_ENABLED=${CHANNEL_ENABLED:-}
       - CHANNEL_CHAT_ID=${CHANNEL_CHAT_ID:-}
+      # GoIndex 放送字幕同步源（默认启用 subtitle.nanakofansub.workers.dev）
+      - GOINDEX_ENABLED=${GOINDEX_ENABLED:-}
+      - GOINDEX_BASE_URL=${GOINDEX_BASE_URL:-}
+      - GOINDEX_PASSWORD=${GOINDEX_PASSWORD:-}
       #- SCHEDULER_INTERVAL_SECONDS=300
       #- SUBSCRIPTION_ANILIST_IDS=16498,1535
       #- SUBSCRIPTION_NAME_KEYWORDS=Attack on Titan,Shingeki

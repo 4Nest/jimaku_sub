@@ -554,6 +554,13 @@ impl Database {
         Ok(row.0)
     }
 
+    pub async fn get_channel_pushed_count(&self) -> Result<i64> {
+        let row: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM channel_files WHERE pushed = 1")
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(row.0)
+    }
+
     // ---------- 频道全量推送 ----------
 
     /// 读取频道推送基线时间（首次启用时由 scheduler 写入）

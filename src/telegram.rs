@@ -9,6 +9,13 @@ use tracing::info;
 /// 通知用 Bot：带限流，自动遵循 Telegram API 速率限制并在 429 时等待重试
 pub type ThrottledBot = Throttle<Bot>;
 
+/// 字幕来源站点（用于构造通知卡片与频道 Caption 的来源链接）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubtitleSource<'a> {
+    Jimaku { entry_id: i64 },
+    GoIndex { site_url: &'a str },
+}
+
 /// 一条新字幕通知所需的全部信息
 pub struct NewSubtitle<'a> {
     /// notified_files 表行 id，用于下载按钮 callback
@@ -20,7 +27,7 @@ pub struct NewSubtitle<'a> {
     pub file_size: i64,
     pub file_url: &'a str,
     pub file_modified: DateTime<Utc>,
-    pub entry_id: i64,
+    pub source: SubtitleSource<'a>,
     pub downloaded: bool,
 }
 

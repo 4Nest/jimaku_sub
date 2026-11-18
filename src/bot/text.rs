@@ -2,7 +2,7 @@
 
 use crate::database::Subscription;
 use crate::jimaku::Entry;
-use crate::telegram::NewSubtitle;
+use crate::telegram::{NewSubtitle, SubtitleSource};
 
 /// 新字幕通知卡片（HTML parse mode，所有外部内容需转义）
 pub fn new_subtitle_card(sub: &NewSubtitle<'_>) -> String {
@@ -26,6 +26,21 @@ pub fn new_subtitle_card(sub: &NewSubtitle<'_>) -> String {
         .map(|lang| format!("🈳 语言: <code>{}</code>\n", lang))
         .unwrap_or_default();
 
+    let site_link = match sub.source {
+        SubtitleSource::Jimaku { entry_id } => {
+            format!(
+                "<a href=\"https://jimaku.cc/entry/{}\">作品页面</a>",
+                entry_id
+            )
+        }
+        SubtitleSource::GoIndex { site_url } => {
+            format!(
+                "<a href=\"{}\">Nanako 字幕站</a>",
+                html_attr_escape(site_url)
+            )
+        }
+    };
+
     format!(
         "🎬 <b>新字幕发布</b>\n\n\
         📺 <b>{}</b>\n\
@@ -33,7 +48,7 @@ pub fn new_subtitle_card(sub: &NewSubtitle<'_>) -> String {
         📝 <code>{}</code>\n\
         {}\
         📦 大小: <code>{}</code> · 🕐 {}\n\
-        🔗 <a href=\"{}\">下载字幕</a> · <a href=\"https://jimaku.cc/entry/{}\">作品页面</a>\n\n\
+        🔗 <a href=\"{}\">下载字幕</a> · {}\n\n\
         {}",
         html_escape(display_name),
         japanese_line,
@@ -42,7 +57,7 @@ pub fn new_subtitle_card(sub: &NewSubtitle<'_>) -> String {
         size_str,
         format_time(sub.file_modified),
         html_attr_escape(sub.file_url),
-        sub.entry_id,
+        site_link,
         download_status
     )
 }
@@ -162,9 +177,9 @@ pub struct ChannelSubtitle<'a> {
     pub japanese_name: Option<&'a str>,
     pub file_name: &'a str,
     pub file_size: i64,
-    /// jimaku 下载直链（仅超大文件链接卡片使用）
+    /// 下载直链（超大文件链接卡片使用）
     pub file_url: &'a str,
-    pub entry_id: i64,
+    pub source: SubtitleSource<'a>,
     /// 有 id 时在 meta 行附加 AniList 文字链接
     pub anilist_id: Option<i32>,
     pub file_modified: chrono::DateTime<chrono::Utc>,
@@ -216,13 +231,13 @@ fn channel_body(sub: &ChannelSubtitle<'_>) -> String {
         md_escape(&format_time(sub.file_modified))
     );
 
-    text.push_str(&format!(
-        " │ 🔗 {}",
-        md_link(
-            "jimaku",
-            &format!("https://jimaku.cc/entry/{}", sub.entry_id)
-        )
-    ));
+    let source_link = match sub.source {
+        SubtitleSource::Jimaku { entry_id } => {
+            md_link("jimaku", &format!("https://jimaku.cc/entry/{}", entry_id))
+        }
+        SubtitleSource::GoIndex { site_url } => md_link("Nanako", site_url),
+    };
+    text.push_str(&format!(" │ 🔗 {}", source_link));
 
     if let Some(id) = sub.anilist_id {
         text.push_str(&format!(
@@ -261,12 +276,16 @@ pub fn channel_caption(sub: &ChannelSubtitle<'_>) -> String {
     }
 }
 
-/// 超过发送上限的文件：频道文字卡片（附 jimaku 下载直链）
+/// 超过发送上限的文件：频道文字卡片（附下载直链）
 pub fn channel_link_card(sub: &ChannelSubtitle<'_>) -> String {
+    let hint = match sub.source {
+        SubtitleSource::Jimaku { .. } => "文件超过发送上限，请从 jimaku 下载",
+        SubtitleSource::GoIndex { .. } => "文件超过发送上限，请从源站下载",
+    };
     format!(
         "{}\n⚠️ {}：{}",
         channel_body(sub),
-        md_escape("文件超过发送上限，请从 jimaku 下载"),
+        md_escape(hint),
         md_link("点击下载", sub.file_url)
     )
 }
@@ -325,18 +344,41 @@ mod tests {
         channel_caption, channel_link_card, detect_language, format_size, html_attr_escape,
         ChannelSubtitle,
     };
+    use crate::telegram::SubtitleSource;
+
     fn sub(ja: Option<&str>) -> ChannelSubtitle<'_> {
         ChannelSubtitle {
             japanese_name: ja,
             file_name: "S01E13.WEBRip.TVer.ja[cc].srt",
             file_size: 45_000,
-            entry_id: 11783,
+            source: SubtitleSource::Jimaku { entry_id: 11783 },
             file_url: "https://jimaku.cc/file/1",
             anilist_id: Some(999999),
             file_modified: chrono::DateTime::parse_from_rfc3339("2026-10-07T15:20:00+00:00")
                 .unwrap()
                 .with_timezone(&chrono::Utc),
         }
+    }
+
+    #[test]
+    fn goindex_caption_renders_nanako_link_and_hashtag() {
+        let s = ChannelSubtitle {
+            japanese_name: Some("塩対応の佐藤さんが俺にだけ甘い"),
+            file_name: "20261103 2030 [AT-X] 塩対応の佐藤さんが俺にだけ甘い #05 [字].ass",
+            file_size: 204_451,
+            source: SubtitleSource::GoIndex {
+                site_url: "https://subtitle.nanakofansub.workers.dev",
+            },
+            file_url: "https://subtitle.nanakofansub.workers.dev/f.ass",
+            anilist_id: None,
+            file_modified: chrono::DateTime::parse_from_rfc3339("2026-11-17T21:48:36+00:00")
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+        };
+        let c = channel_caption(&s);
+        assert!(c.contains("🔗 [Nanako](https://subtitle.nanakofansub.workers.dev)"));
+        assert!(!c.contains("jimaku"));
+        assert!(c.contains("\n\n\\#塩対応の佐藤さんが俺にだけ甘い"));
     }
 
     #[test]
@@ -409,7 +451,7 @@ mod tests {
             japanese_name: Some(&long),
             file_name: &long,
             file_size: 1,
-            entry_id: 1,
+            source: SubtitleSource::Jimaku { entry_id: 1 },
             file_url: "https://jimaku.cc/file/1",
             anilist_id: Some(1),
             file_modified: chrono::Utc::now(),

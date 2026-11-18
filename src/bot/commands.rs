@@ -143,24 +143,36 @@ pub async fn answer(bot: Bot, msg: Message, cmd: Command, state: AppState) -> Re
 async fn build_status_text(state: &AppState) -> anyhow::Result<String> {
     let notified = state.db.get_notified_files_count().await?;
     let downloaded = state.db.get_downloaded_count().await?;
+    let channel_pushed = state.db.get_channel_pushed_count().await?;
     let last_check = state.db.get_last_check_time().await?;
     let subs = state.db.list_subscriptions().await?;
     let subs_str = format_subscriptions(&subs);
 
     let last_check_str = match last_check {
         Some(ts) => chrono::DateTime::from_timestamp(ts, 0)
-            .map(|d| d.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+            .map(crate::bot::text::format_time)
             .unwrap_or_else(|| "未知".to_string()),
         None => "尚未检查".to_string(),
+    };
+
+    let goindex_str = if state.config.goindex.enabled {
+        format!(
+            "开启 (<code>{}</code>)",
+            html_escape(&state.config.goindex.base_url)
+        )
+    } else {
+        "关闭".to_string()
     };
 
     Ok(format!(
         "📊 <b>服务状态</b>\n\n\
         🔔 已通知字幕: <code>{}</code>\n\
+        📡 频道已推送: <code>{}</code>\n\
         ⬇️ 已下载字幕: <code>{}</code>\n\
+        🌐 GoIndex 同步: {}\n\
         ⏰ 上次检查: <code>{}</code>\n\n\
         📋 <b>动态订阅</b>\n{}",
-        notified, downloaded, last_check_str, subs_str
+        notified, channel_pushed, downloaded, goindex_str, last_check_str, subs_str
     ))
 }
 

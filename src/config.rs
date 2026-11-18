@@ -20,6 +20,8 @@ pub struct Config {
     pub logging: LoggingConfig,
     #[serde(default)]
     pub channel: ChannelConfig,
+    #[serde(default)]
+    pub goindex: GoIndexConfig,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -127,6 +129,35 @@ pub struct ChannelConfig {
     pub chat_id: String,
 }
 
+/// GoIndex 放送字幕源配置（默认启用 subtitle.nanakofansub.workers.dev）
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct GoIndexConfig {
+    #[serde(default = "default_goindex_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_goindex_base_url")]
+    pub base_url: String,
+    #[serde(default)]
+    pub password: String,
+}
+
+impl Default for GoIndexConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_goindex_enabled(),
+            base_url: default_goindex_base_url(),
+            password: String::new(),
+        }
+    }
+}
+
+fn default_goindex_enabled() -> bool {
+    true
+}
+
+fn default_goindex_base_url() -> String {
+    "https://subtitle.nanakofansub.workers.dev".to_string()
+}
+
 fn default_database_url() -> String {
     "sqlite://data/jimaku_subscriber.db".to_string()
 }
@@ -221,6 +252,15 @@ impl Config {
         if let Some(v) = non_empty("CHANNEL_CHAT_ID") {
             self.channel.chat_id = v;
         }
+        if let Some(v) = non_empty("GOINDEX_ENABLED") {
+            self.goindex.enabled = parse_bool_env("GOINDEX_ENABLED", &v)?;
+        }
+        if let Some(v) = non_empty("GOINDEX_BASE_URL") {
+            self.goindex.base_url = v;
+        }
+        if let Some(v) = non_empty("GOINDEX_PASSWORD") {
+            self.goindex.password = v;
+        }
         if let Some(v) = non_empty("SUBSCRIPTION_ANILIST_IDS") {
             self.subscription.anilist_ids = v
                 .split(',')
@@ -263,6 +303,12 @@ impl Config {
                 _ => anyhow::bail!(
                     "CHANNEL_CHAT_ID must be a numeric channel id (-100...) when channel is enabled"
                 ),
+            }
+        }
+        if self.goindex.enabled {
+            let url = self.goindex.base_url.trim();
+            if !(url.starts_with("http://") || url.starts_with("https://")) {
+                anyhow::bail!("GOINDEX_BASE_URL must start with http:// or https://");
             }
         }
         Ok(())

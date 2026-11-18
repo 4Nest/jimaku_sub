@@ -1,6 +1,6 @@
 # Jimaku 字幕订阅通知服务
 
-定时轮询 [jimaku.cc](https://jimaku.cc) 的新字幕，通过 Telegram Bot 推送通知，支持可选的自动下载。
+定时轮询 [jimaku.cc](https://jimaku.cc) 与 [Nanako GoIndex](https://subtitle.nanakofansub.workers.dev/) 的新字幕，通过 Telegram Bot 推送通知与频道全量同步，支持可选的自动下载。
 
 ## 功能特性
 
@@ -85,6 +85,9 @@ docker compose up -d
 | `LOG_RETENTION_DAYS` | ❌ | 日志保留天数 (默认 `30`) |
 | `CHANNEL_ENABLED` | ❌ | 全量字幕频道推送 (`true`/`false`，默认 `false`) |
 | `CHANNEL_CHAT_ID` | ❌ | 频道数字 id（`-100` 开头，启用频道推送时必需） |
+| `GOINDEX_ENABLED` | ❌ | 是否启用 GoIndex 放送字幕同步 (`true`/`false`，默认 `true`) |
+| `GOINDEX_BASE_URL` | ❌ | GoIndex 站点地址 (默认 `https://subtitle.nanakofansub.workers.dev`) |
+| `GOINDEX_PASSWORD` | ❌ | GoIndex 访问密码 (默认空) |
 | `RUST_LOG` | ❌ | 日志级别 (默认 `info,teloxide=warn`) |
 | `SUBSCRIPTION_ANILIST_IDS` | ❌ | 订阅的 AniList ID，逗号分隔 |
 | `SUBSCRIPTION_NAME_KEYWORDS` | ❌ | 订阅关键词，逗号分隔 |
