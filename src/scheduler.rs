@@ -308,15 +308,20 @@ impl Scheduler {
             return Ok(());
         }
 
-        // 1) 全量频道推送（包含首次启动时的站内现有存量，后续通过 channel_files.file_url 去重）
+        // 1) 全量频道推送（包含首次启动时的站内现有存量，后续通过 file_url + file_name 双重去重，避免目录归档重推）
         if let Some(ref channel) = self.channel {
-            match self.db.get_handled_channel_urls(GOINDEX_ENTRY_ID).await {
-                Ok(handled_urls) => {
+            match (
+                self.db.get_handled_channel_urls(GOINDEX_ENTRY_ID).await,
+                self.db
+                    .get_handled_channel_file_names(GOINDEX_ENTRY_ID)
+                    .await,
+            ) {
+                (Ok(handled_urls), Ok(mut handled_names)) => {
                     for file in &files {
                         if cancel.is_cancelled() {
                             return Ok(());
                         }
-                        if handled_urls.contains(&file.url) {
+                        if handled_urls.contains(&file.url) || handled_names.contains(&file.name) {
                             continue;
                         }
 
@@ -381,6 +386,7 @@ impl Scheduler {
                             )
                             .await;
 
+                        handled_names.insert(file.name.clone());
                         self.handle_channel_result(row_id, &file.name, result).await;
                         self.write_heartbeat().await;
 
@@ -389,8 +395,8 @@ impl Scheduler {
                         }
                     }
                 }
-                Err(e) => {
-                    warn!("Failed to load GoIndex handled channel URLs: {}", e);
+                (Err(e), _) | (_, Err(e)) => {
+                    warn!("Failed to load GoIndex handled channel records: {}", e);
                 }
             }
         }
@@ -399,13 +405,17 @@ impl Scheduler {
             return Ok(());
         }
 
-        // 2) 关键词与动态订阅匹配 → 私聊通知 / 自动下载
+        // 2) 关键词与动态订阅匹配 → 私聊通知 / 自动下载（同样按 file_url + file_name 双重去重）
         let handled_notified = self.db.get_handled_notified_urls(GOINDEX_ENTRY_ID).await?;
+        let mut handled_notified_names = self
+            .db
+            .get_handled_notified_file_names(GOINDEX_ENTRY_ID)
+            .await?;
         for file in &files {
             if cancel.is_cancelled() {
                 return Ok(());
             }
-            if handled_notified.contains(&file.url) {
+            if handled_notified.contains(&file.url) || handled_notified_names.contains(&file.name) {
                 continue;
             }
             let Some(policy) = resolve_goindex_policy(
@@ -418,6 +428,7 @@ impl Scheduler {
             ) else {
                 continue;
             };
+            handled_notified_names.insert(file.name.clone());
 
             let mut downloaded = false;
             let mut downloaded_outcome = None;

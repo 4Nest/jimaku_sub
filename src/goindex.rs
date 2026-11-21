@@ -3,6 +3,7 @@ use chrono::{DateTime, Utc};
 use reqwest::{header, StatusCode};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
+use std::collections::{HashSet, VecDeque};
 use tracing::debug;
 
 /// GoIndex 源在数据库（`channel_files` / `notified_files`）中使用的固定哨兵 `entry_id`
@@ -12,6 +13,9 @@ pub const GOINDEX_ENTRY_ID: i64 = -1;
 const FOLDER_MIME: &str = "application/vnd.google-apps.folder";
 const MAX_SCAN_DEPTH: usize = 3;
 const MAX_PAGES_PER_DIR: usize = 20;
+
+/// 站长用于存放历史归档文件的目录名（移动旧文件进这些目录时跳过扫描）
+const ARCHIVE_DIR_NAMES: &[&str] = &["old", "archive", "archives", "backup", "bak"];
 
 const SUBTITLE_EXTENSIONS: &[&str] = &[
     "ass", "ssa", "srt", "vtt", "sup", "sub", "idx", "mks", "ttml", "dfxp", "smi", "lrc", "zip",
@@ -63,6 +67,8 @@ struct NestedData {
 
 #[derive(Debug, Deserialize)]
 struct RawItem {
+    #[serde(default)]
+    id: Option<String>,
     name: String,
     #[serde(default, rename = "mimeType")]
     mime_type: String,
@@ -117,25 +123,41 @@ impl GoIndexClient {
         &self.base_url
     }
 
-    /// 扫描 GoIndex 站点并返回按修改时间升序排列的字幕文件列表
+    /// 扫描 GoIndex 站点并返回按修改时间升序排列的去重字幕文件列表（自动跳过归档子目录）
     pub async fn list_subtitle_files(&self) -> Result<Vec<GoIndexFile>> {
         let mut out = Vec::new();
-        let mut stack: Vec<(Vec<String>, usize)> = vec![(Vec::new(), 0)];
+        let mut seen_ids: HashSet<String> = HashSet::new();
+        let mut seen_names: HashSet<String> = HashSet::new();
+        // 使用 BFS 保证根目录优先于子目录，同名文件优先保留浅层路径
+        let mut queue: VecDeque<(Vec<String>, usize)> = VecDeque::from([(Vec::new(), 0)]);
 
-        while let Some((segments, depth)) = stack.pop() {
+        while let Some((segments, depth)) = queue.pop_front() {
             let items = self.list_dir(&segments).await?;
             for item in items {
                 if item.mime_type == FOLDER_MIME {
-                    if depth < MAX_SCAN_DEPTH && !item.name.starts_with('.') {
+                    if depth < MAX_SCAN_DEPTH && should_scan_dir(&item.name) {
                         let mut child = segments.clone();
                         child.push(item.name);
-                        stack.push((child, depth + 1));
+                        queue.push_back((child, depth + 1));
+                    } else {
+                        debug!("Skipping GoIndex directory: {}", item.name);
                     }
                     continue;
                 }
 
                 if !is_subtitle_filename(&item.name) {
                     debug!("Skipping non-subtitle GoIndex item: {}", item.name);
+                    continue;
+                }
+
+                if let Some(id) = item.id.as_deref().filter(|s| !s.is_empty()) {
+                    if !seen_ids.insert(id.to_string()) {
+                        debug!("Skipping duplicate GoIndex file id {}: {}", id, item.name);
+                        continue;
+                    }
+                }
+                if !seen_names.insert(item.name.clone()) {
+                    debug!("Skipping duplicate GoIndex file name: {}", item.name);
                     continue;
                 }
 
@@ -217,6 +239,15 @@ fn truncate_err(body: &str) -> String {
         Some((idx, _)) => format!("{}...", &trimmed[..idx]),
         None => trimmed.to_string(),
     }
+}
+
+fn should_scan_dir(name: &str) -> bool {
+    let trimmed = name.trim();
+    if trimmed.is_empty() || trimmed.starts_with('.') {
+        return false;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    !ARCHIVE_DIR_NAMES.contains(&lower.as_str())
 }
 
 pub fn is_subtitle_filename(name: &str) -> bool {
@@ -612,11 +643,12 @@ mod tests {
                 let n = stream.read(&mut buf).await.unwrap_or(0);
                 let req = String::from_utf8_lossy(&buf[..n]);
                 let body = if req.starts_with("POST / ") && !req.contains("tok2") {
-                    r#"{"files":[{"name":"20261103 2030 [AT-X] テスト番組 #02 [字].srt","mimeType":"application/x-subrip","size":"1200","modifiedTime":"2026-11-18T02:00:00Z"},{"name":"sub","mimeType":"application/vnd.google-apps.folder"},{"name":"readme.txt","mimeType":"text/plain","size":"10"}],"nextPageToken":"tok2"}"#
+                    r#"{"files":[{"id":"id2","name":"20261103 2030 [AT-X] テスト番組 #02 [字].srt","mimeType":"application/x-subrip","size":"1200","modifiedTime":"2026-11-18T02:00:00Z"},{"name":"old","mimeType":"application/vnd.google-apps.folder"},{"name":"sub","mimeType":"application/vnd.google-apps.folder"},{"name":"readme.txt","mimeType":"text/plain","size":"10"}],"nextPageToken":"tok2"}"#
                 } else if req.starts_with("POST / ") {
-                    r#"{"files":[{"name":"20261103 2000 [AT-X] テスト番組 #01 [字].ass","mimeType":"text/x-ssa","size":3400,"modifiedTime":"2026-11-18T01:00:00Z"}]}"#
+                    r#"{"files":[{"id":"id1","name":"20261103 2000 [AT-X] テスト番組 #01 [字].ass","mimeType":"text/x-ssa","size":3400,"modifiedTime":"2026-11-18T01:00:00Z"}]}"#
                 } else {
-                    r#"{"data":{"files":[{"name":"nested #3.ass","mimeType":"text/x-ssa","size":"500","modifiedTime":"2026-11-18T03:00:00Z"}]}}"#
+                    // 子目录中含一条与根目录重复的同名/同 id 文件（应去重）和一条新文件
+                    r#"{"data":{"files":[{"id":"id2","name":"20261103 2030 [AT-X] テスト番組 #02 [字].srt","mimeType":"application/x-subrip","size":"1200","modifiedTime":"2026-11-18T02:00:00Z"},{"id":"id3","name":"nested #3.ass","mimeType":"text/x-ssa","size":"500","modifiedTime":"2026-11-18T03:00:00Z"}]}}"#
                 };
                 let resp = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -634,11 +666,14 @@ mod tests {
         };
 
         let files = client.list_subtitle_files().await.unwrap();
+        // `old/` 归档目录被跳过且子目录重复文件被去重，共 3 个不重复文件
         assert_eq!(files.len(), 3);
         // 按 modifiedTime 升序排列
         assert_eq!(files[0].size, 3400);
         assert_eq!(files[0].program_title, "テスト番組");
         assert_eq!(files[1].size, 1200);
+        // 根目录优先于子目录
+        assert!(!files[1].url.contains("/sub/"));
         assert!(files[2].url.ends_with("/sub/nested%20%233.ass"));
     }
 }

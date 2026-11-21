@@ -238,6 +238,17 @@ impl Database {
         Ok(rows.into_iter().map(|(url,)| url).collect())
     }
 
+    /// 按 entry 一次性读取已处理（已通知或已死信）的文件名集合，避免目录迁移后 URL 变化导致重复通知
+    pub async fn get_handled_notified_file_names(&self, entry_id: i64) -> Result<HashSet<String>> {
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "SELECT file_name FROM notified_files WHERE entry_id = ? AND notified != 0",
+        )
+        .bind(entry_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(|(name,)| name).collect())
+    }
+
     /// 按 entry 一次性读取已下载到本地的文件 URL 集合
     pub async fn get_downloaded_urls(&self, entry_id: i64) -> Result<HashSet<String>> {
         let rows: Vec<(String,)> = sqlx::query_as(
@@ -596,6 +607,17 @@ impl Database {
                 .await?;
         Ok(rows.into_iter().map(|(url,)| url).collect())
     }
+
+    /// 按 entry 一次性读取频道已处理（已推送或死信）的文件名集合，避免目录迁移后 URL 变化导致重复推送
+    pub async fn get_handled_channel_file_names(&self, entry_id: i64) -> Result<HashSet<String>> {
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "SELECT file_name FROM channel_files WHERE entry_id = ? AND pushed != 0",
+        )
+        .bind(entry_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(|(name,)| name).collect())
+    }
     /// 静默标记文件已推送（基线前的 backlog，不发频道）
     pub async fn mark_channel_silent(
         &self,
@@ -885,6 +907,11 @@ mod tests {
             .await
             .unwrap()
             .contains("http://x/new"));
+        assert!(db
+            .get_handled_channel_file_names(1)
+            .await
+            .unwrap()
+            .contains("new.srt"));
         assert!(db.list_channel_pending().await.unwrap().is_empty());
 
         // 5 次失败转死信，死信行 upsert 不复活
