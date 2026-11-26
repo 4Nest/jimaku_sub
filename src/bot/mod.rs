@@ -15,6 +15,7 @@ use tracing::warn;
 use crate::config::Config;
 use crate::database::Database;
 use crate::downloader::Downloader;
+use crate::goindex::GoIndexClient;
 use crate::jimaku::JimakuClient;
 use crate::scheduler::Scheduler;
 
@@ -24,6 +25,7 @@ pub struct AppState {
     pub scheduler: Arc<Scheduler>,
     pub config: Config,
     pub jimaku: Arc<JimakuClient>,
+    pub goindex: Option<Arc<GoIndexClient>>,
     pub downloader: Arc<Downloader>,
     pub allowed_chat_id: ChatId,
     pub cancel: CancellationToken,

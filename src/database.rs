@@ -334,6 +334,16 @@ impl Database {
         Ok(())
     }
 
+    /// 文件在远端被归档迁移后回写最新 URL（忽略与已有行冲突的极端情况）
+    pub async fn update_notified_file_url(&self, id: i64, new_url: &str) -> Result<()> {
+        sqlx::query("UPDATE OR IGNORE notified_files SET file_url = ? WHERE id = ?")
+            .bind(new_url)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     pub async fn mark_notified(&self, id: i64) -> Result<()> {
         sqlx::query("UPDATE notified_files SET notified = 1, notified_at = ? WHERE id = ?")
             .bind(Utc::now().to_rfc3339())
@@ -683,6 +693,15 @@ impl Database {
     pub async fn mark_channel_pushed(&self, id: i64) -> Result<()> {
         sqlx::query("UPDATE channel_files SET pushed = 1, pushed_at = ? WHERE id = ?")
             .bind(Utc::now().to_rfc3339())
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn update_channel_file_url(&self, id: i64, new_url: &str) -> Result<()> {
+        sqlx::query("UPDATE OR IGNORE channel_files SET file_url = ? WHERE id = ?")
+            .bind(new_url)
             .bind(id)
             .execute(&self.pool)
             .await?;

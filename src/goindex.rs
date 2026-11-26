@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use reqwest::{header, StatusCode};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
@@ -181,6 +181,59 @@ impl GoIndexClient {
         Ok(out)
     }
 
+    /// 为已归档迁移的文件按优先级生成可能的直连 URL 候选（O(1) 零列举探测）：
+    /// 1) 按文件名日期前缀推测 `YYYY.MM.DD`（及 +1/-1 天跨午夜归档）
+    /// 2) `old/` 归档目录
+    /// 3) 根目录
+    pub fn candidate_archive_urls(&self, file_name: &str, exclude_url: &str) -> Vec<String> {
+        let mut candidates: Vec<String> = Vec::new();
+        let mut push_unique = |url: String| {
+            if url != exclude_url && !candidates.contains(&url) {
+                candidates.push(url);
+            }
+        };
+
+        if let Some(date) = extract_filename_date(file_name) {
+            for offset_days in [0i64, 1, -1] {
+                if let Some(d) = date.checked_add_signed(chrono::Duration::days(offset_days)) {
+                    let dir = d.format("%Y.%m.%d").to_string();
+                    push_unique(build_file_url(&self.base_url, &[dir], file_name));
+                }
+            }
+        }
+
+        push_unique(build_file_url(
+            &self.base_url,
+            &["old".to_string()],
+            file_name,
+        ));
+        push_unique(build_file_url(&self.base_url, &[], file_name));
+        candidates
+    }
+
+    /// 兜底全站定位同名文件（包含 `old/` 与所有历史日期子目录），用于文件被移动到未知目录名时找回直链
+    pub async fn find_file_url_by_name(&self, file_name: &str) -> Result<Option<String>> {
+        let mut queue: VecDeque<(Vec<String>, usize)> = VecDeque::from([(Vec::new(), 0)]);
+
+        while let Some((segments, depth)) = queue.pop_front() {
+            let items = self.list_dir(&segments).await?;
+            for item in items {
+                if item.mime_type == FOLDER_MIME {
+                    if depth < MAX_SCAN_DEPTH && !item.name.starts_with('.') {
+                        let mut child = segments.clone();
+                        child.push(item.name);
+                        queue.push_back((child, depth + 1));
+                    }
+                    continue;
+                }
+                if item.name == file_name {
+                    return Ok(Some(build_file_url(&self.base_url, &segments, &item.name)));
+                }
+            }
+        }
+        Ok(None)
+    }
+
     async fn list_dir(&self, segments: &[String]) -> Result<Vec<RawItem>> {
         let dir_url = build_dir_url(&self.base_url, segments);
         let mut all = Vec::new();
@@ -242,12 +295,39 @@ fn truncate_err(body: &str) -> String {
 }
 
 fn should_scan_dir(name: &str) -> bool {
+    should_scan_dir_at(name, Utc::now().date_naive())
+}
+
+fn should_scan_dir_at(name: &str, today: NaiveDate) -> bool {
     let trimmed = name.trim();
     if trimmed.is_empty() || trimmed.starts_with('.') {
         return false;
     }
     let lower = trimmed.to_ascii_lowercase();
-    !ARCHIVE_DIR_NAMES.contains(&lower.as_str())
+    if ARCHIVE_DIR_NAMES.contains(&lower.as_str()) {
+        return false;
+    }
+    // 按日归档目录（如 `2026.11.21` / `2026-11-21`）：只扫描近 2 天内，跳过更早的历史归档目录
+    if let Some(dir_date) = parse_archive_date_dir(trimmed) {
+        if today.signed_duration_since(dir_date).num_days() > 2 {
+            return false;
+        }
+    }
+    true
+}
+
+fn parse_archive_date_dir(name: &str) -> Option<NaiveDate> {
+    NaiveDate::parse_from_str(name, "%Y.%m.%d")
+        .or_else(|_| NaiveDate::parse_from_str(name, "%Y-%m-%d"))
+        .ok()
+}
+
+fn extract_filename_date(file_name: &str) -> Option<NaiveDate> {
+    let bytes = file_name.as_bytes();
+    if bytes.len() < 8 || !bytes[..8].iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    NaiveDate::parse_from_str(&file_name[..8], "%Y%m%d").ok()
 }
 
 pub fn is_subtitle_filename(name: &str) -> bool {
@@ -675,5 +755,70 @@ mod tests {
         // 根目录优先于子目录
         assert!(!files[1].url.contains("/sub/"));
         assert!(files[2].url.ends_with("/sub/nested%20%233.ass"));
+    }
+
+    #[test]
+    fn skips_old_date_archive_dirs_and_generates_recovery_candidates() {
+        use super::{should_scan_dir_at, GoIndexClient};
+        use chrono::NaiveDate;
+
+        let today = NaiveDate::from_ymd_opt(2026, 11, 26).unwrap();
+        assert!(!should_scan_dir_at("old", today));
+        assert!(!should_scan_dir_at("2026.11.21", today));
+        assert!(!should_scan_dir_at("2026.11.23", today));
+        assert!(should_scan_dir_at("2026.11.24", today));
+        assert!(should_scan_dir_at("2026.11.25", today));
+        assert!(should_scan_dir_at("2026.11.26", today));
+
+        let client = GoIndexClient::new("https://subtitle.nanakofansub.workers.dev", "").unwrap();
+        let name = "20261125 2130 [AT-X] 探偵はもう、死んでいる。Season2 #08 [字].srt";
+        let root_url = format!(
+            "https://subtitle.nanakofansub.workers.dev/{}",
+            encode_path_segment(name)
+        );
+        let candidates = client.candidate_archive_urls(name, &root_url);
+        assert!(candidates[0].contains("/2026.11.25/"));
+        assert!(candidates.iter().any(|u| u.contains("/old/")));
+        assert!(!candidates.contains(&root_url));
+    }
+
+    #[tokio::test]
+    async fn finds_moved_file_url_inside_old_or_date_archive_dir() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            for _ in 0..2 {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let mut buf = vec![0u8; 2048];
+                let n = stream.read(&mut buf).await.unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]);
+                let body = if req.starts_with("POST / ") {
+                    r#"{"files":[{"name":"2026.11.25","mimeType":"application/vnd.google-apps.folder"}]}"#
+                } else {
+                    r#"{"files":[{"name":"target #08.srt","mimeType":"application/x-subrip","size":"123"}]}"#
+                };
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(resp.as_bytes()).await;
+            }
+        });
+
+        let client = GoIndexClient {
+            client: reqwest::Client::builder().no_proxy().build().unwrap(),
+            base_url: format!("http://{}", addr),
+            password: String::new(),
+        };
+        let found = client
+            .find_file_url_by_name("target #08.srt")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(found.ends_with("/2026.11.25/target%20%2308.srt"));
     }
 }

@@ -75,7 +75,7 @@ async fn main() -> Result<()> {
     let scheduler = Arc::new(Scheduler::new(
         config.clone(),
         jimaku.clone(),
-        goindex,
+        goindex.clone(),
         db.clone(),
         downloader.clone(),
         notifier.clone(),
@@ -89,6 +89,7 @@ async fn main() -> Result<()> {
         scheduler: scheduler.clone(),
         config,
         jimaku,
+        goindex,
         downloader,
         allowed_chat_id: notifier.chat_id(),
         cancel: cancel.clone(),

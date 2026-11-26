@@ -2,7 +2,7 @@
 
 use teloxide::prelude::*;
 use teloxide::types::{CallbackQuery, InlineKeyboardMarkup, InputFile, ParseMode};
-use tracing::error;
+use tracing::{error, info, warn};
 
 use crate::bot::keyboards::{
     parse_callback, subscription_panel, unsub_confirm_keyboard, CallbackAction,
@@ -10,7 +10,8 @@ use crate::bot::keyboards::{
 use crate::bot::text::{display_entry_title, html_attr_escape, html_escape, subscription_card};
 use crate::bot::AppState;
 use crate::database::Subscription;
-use crate::downloader::FetchedSubtitle;
+use crate::downloader::{DownloadOutcome, FetchedSubtitle};
+use crate::goindex::GOINDEX_ENTRY_ID;
 use crate::scheduler::MAX_DOCUMENT_SIZE;
 
 pub async fn handle_callback(
@@ -345,25 +346,21 @@ async fn handle_download_file(
         .unwrap_or(state.config.download.enabled);
 
     if persist_to_disk {
-        match state
-            .downloader
-            .download_subtitle_with_outcome(&record.entry_name, &record.file_name, &record.file_url)
-            .await
-        {
-            Ok(outcome) => {
+        match download_with_goindex_fallback(state, &record, file_id).await {
+            Ok((outcome, effective_url)) => {
                 let _ = state
                     .db
                     .record_file(
                         record.entry_id,
                         &record.entry_name,
                         &record.file_name,
-                        &record.file_url,
+                        &effective_url,
                         record.file_size,
                         true,
                     )
                     .await;
                 if outcome.size > MAX_DOCUMENT_SIZE {
-                    send_oversize_hint(bot, chat_id, &record.file_name, &record.file_url).await?;
+                    send_oversize_hint(bot, chat_id, &record.file_name, &effective_url).await?;
                     return Ok(());
                 }
                 if let Err(e) = bot
@@ -389,12 +386,8 @@ async fn handle_download_file(
             }
         }
     } else {
-        match state
-            .downloader
-            .fetch_subtitle_bytes(&record.file_url, MAX_DOCUMENT_SIZE as usize)
-            .await
-        {
-            Ok(FetchedSubtitle::Bytes(data)) => {
+        match fetch_bytes_with_goindex_fallback(state, &record, file_id).await {
+            Ok((FetchedSubtitle::Bytes(data), _)) => {
                 let input = InputFile::memory(data).file_name(record.file_name.clone());
                 if let Err(e) = bot.send_document(chat_id, input).await {
                     error!("Failed to send memory document {}: {}", record.file_name, e);
@@ -402,8 +395,8 @@ async fn handle_download_file(
                         .await?;
                 }
             }
-            Ok(FetchedSubtitle::TooLarge) => {
-                send_oversize_hint(bot, chat_id, &record.file_name, &record.file_url).await?;
+            Ok((FetchedSubtitle::TooLarge, effective_url)) => {
+                send_oversize_hint(bot, chat_id, &record.file_name, &effective_url).await?;
             }
             Err(e) => {
                 error!("Failed to fetch subtitle {}: {}", record.file_name, e);
@@ -421,6 +414,120 @@ async fn handle_download_file(
     }
 
     Ok(())
+}
+
+/// 下载到本地：GoIndex 文件原 URL 失效（如被归档移入日期子目录或 `old/`）时自动寻址重试并回写最新 URL
+async fn download_with_goindex_fallback(
+    state: &AppState,
+    record: &crate::database::NotifiedFile,
+    file_id: i64,
+) -> anyhow::Result<(DownloadOutcome, String)> {
+    let first_err = match state
+        .downloader
+        .download_subtitle_with_outcome(&record.entry_name, &record.file_name, &record.file_url)
+        .await
+    {
+        Ok(outcome) => return Ok((outcome, record.file_url.clone())),
+        Err(e) => e,
+    };
+
+    if record.entry_id != GOINDEX_ENTRY_ID {
+        return Err(first_err);
+    }
+    let Some(ref goindex) = state.goindex else {
+        return Err(first_err);
+    };
+
+    warn!(
+        "GoIndex download failed for {} ({}), trying archived paths",
+        record.file_name, first_err
+    );
+
+    let candidates = goindex.candidate_archive_urls(&record.file_name, &record.file_url);
+    for url in &candidates {
+        if let Ok(outcome) = state
+            .downloader
+            .download_subtitle_with_outcome(&record.entry_name, &record.file_name, url)
+            .await
+        {
+            info!("Recovered moved GoIndex subtitle via {}", url);
+            let _ = state.db.update_notified_file_url(file_id, url).await;
+            return Ok((outcome, url.clone()));
+        }
+    }
+
+    if let Ok(Some(found_url)) = goindex.find_file_url_by_name(&record.file_name).await {
+        if found_url != record.file_url && !candidates.contains(&found_url) {
+            if let Ok(outcome) = state
+                .downloader
+                .download_subtitle_with_outcome(&record.entry_name, &record.file_name, &found_url)
+                .await
+            {
+                info!("Recovered moved GoIndex subtitle by scan: {}", found_url);
+                let _ = state.db.update_notified_file_url(file_id, &found_url).await;
+                return Ok((outcome, found_url));
+            }
+        }
+    }
+
+    Err(first_err)
+}
+
+/// 内存直取字幕：GoIndex 文件原 URL 失效（如被归档移入日期子目录或 `old/`）时自动寻址重试并回写最新 URL
+async fn fetch_bytes_with_goindex_fallback(
+    state: &AppState,
+    record: &crate::database::NotifiedFile,
+    file_id: i64,
+) -> anyhow::Result<(FetchedSubtitle, String)> {
+    let first_err = match state
+        .downloader
+        .fetch_subtitle_bytes(&record.file_url, MAX_DOCUMENT_SIZE as usize)
+        .await
+    {
+        Ok(fetched) => return Ok((fetched, record.file_url.clone())),
+        Err(e) => e,
+    };
+
+    if record.entry_id != GOINDEX_ENTRY_ID {
+        return Err(first_err);
+    }
+    let Some(ref goindex) = state.goindex else {
+        return Err(first_err);
+    };
+
+    warn!(
+        "GoIndex fetch failed for {} ({}), trying archived paths",
+        record.file_name, first_err
+    );
+
+    let candidates = goindex.candidate_archive_urls(&record.file_name, &record.file_url);
+    for url in &candidates {
+        if let Ok(fetched) = state
+            .downloader
+            .fetch_subtitle_bytes(url, MAX_DOCUMENT_SIZE as usize)
+            .await
+        {
+            info!("Recovered moved GoIndex subtitle via {}", url);
+            let _ = state.db.update_notified_file_url(file_id, url).await;
+            return Ok((fetched, url.clone()));
+        }
+    }
+
+    if let Ok(Some(found_url)) = goindex.find_file_url_by_name(&record.file_name).await {
+        if found_url != record.file_url && !candidates.contains(&found_url) {
+            if let Ok(fetched) = state
+                .downloader
+                .fetch_subtitle_bytes(&found_url, MAX_DOCUMENT_SIZE as usize)
+                .await
+            {
+                info!("Recovered moved GoIndex subtitle by scan: {}", found_url);
+                let _ = state.db.update_notified_file_url(file_id, &found_url).await;
+                return Ok((fetched, found_url));
+            }
+        }
+    }
+
+    Err(first_err)
 }
 
 async fn send_oversize_hint(

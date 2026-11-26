@@ -1099,7 +1099,7 @@ impl Scheduler {
                 }
             };
 
-            let result = self
+            let mut result = self
                 .deliver_to_channel(
                     channel,
                     &file.entry_name,
@@ -1110,6 +1110,82 @@ impl Scheduler {
                     &sub,
                 )
                 .await;
+
+            // 仅在 GoIndex 下载阶段 404（未发出 Telegram 消息）时尝试归档迁移路径恢复
+            if file.entry_id == GOINDEX_ENTRY_ID {
+                if let (Err(ref err), Some(ref goindex)) = (&result, &self.goindex) {
+                    if err.to_string().contains("Download failed with status: 404") {
+                        let candidates =
+                            goindex.candidate_archive_urls(&file.file_name, &file.file_url);
+                        let mut recovered = false;
+                        for alt_url in &candidates {
+                            let alt_sub = ChannelSubtitle {
+                                file_url: alt_url,
+                                ..sub
+                            };
+                            match self
+                                .deliver_to_channel(
+                                    channel,
+                                    &file.entry_name,
+                                    &file.file_name,
+                                    alt_url,
+                                    size,
+                                    self.config.download.enabled,
+                                    &alt_sub,
+                                )
+                                .await
+                            {
+                                Ok(()) => {
+                                    let _ = self.db.update_channel_file_url(file.id, alt_url).await;
+                                    result = Ok(());
+                                    recovered = true;
+                                    break;
+                                }
+                                Err(e)
+                                    if e.to_string()
+                                        .contains("Download failed with status: 404") =>
+                                {
+                                    continue;
+                                }
+                                Err(e) => {
+                                    result = Err(e);
+                                    recovered = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if !recovered {
+                            if let Ok(Some(found_url)) =
+                                goindex.find_file_url_by_name(&file.file_name).await
+                            {
+                                if found_url != file.file_url && !candidates.contains(&found_url) {
+                                    let alt_sub = ChannelSubtitle {
+                                        file_url: &found_url,
+                                        ..sub
+                                    };
+                                    result = self
+                                        .deliver_to_channel(
+                                            channel,
+                                            &file.entry_name,
+                                            &file.file_name,
+                                            &found_url,
+                                            size,
+                                            self.config.download.enabled,
+                                            &alt_sub,
+                                        )
+                                        .await;
+                                    if result.is_ok() {
+                                        let _ = self
+                                            .db
+                                            .update_channel_file_url(file.id, &found_url)
+                                            .await;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
 
             self.handle_channel_result(file.id, &file.file_name, result)
                 .await;
